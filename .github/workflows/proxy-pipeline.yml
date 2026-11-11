@@ -1,0 +1,66 @@
+name: Proxy pipeline
+
+on:
+  schedule:
+    - cron: '0 0 * * *'      # every 24 hours at 00:00 UTC
+  workflow_dispatch:          # manual trigger from the Actions tab
+  push:
+    branches: [main]
+    paths:
+      - 'sub_links.txt'       # also re-run when subscriptions change
+      - 'deepseek_python_simpled.py'
+      - '.github/workflows/proxy-pipeline.yml'
+
+permissions:
+  contents: write             # needed for the bot to commit ALIVE/
+
+concurrency:
+  group: proxy-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180      # full pipeline can be long with many configs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install requests proxy-ip-check
+
+      - name: Download latest Xray Linux release
+        run: |
+          curl -fsSL -o /tmp/xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          mkdir -p "$HOME/.local/bin"
+          unzip -o /tmp/xray.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/xray"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          xray version
+
+      - name: Run pipeline (all steps)
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python3 deepseek_python_simpled.py --steps '1+2+3'
+
+      - name: Commit outputs
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add ALIVE 2>/dev/null || true
+          git add logs/failed.txt 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No output changes — nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: refresh proxy outputs [skip ci]"
+          git push
