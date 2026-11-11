@@ -75,9 +75,9 @@ pip install "requests[socks]"
 # one subscription URL per line; '#' comments allowed
 nano sub_links.txt
 
-python proxy_pipeline.py                  # interactive menu (TTY only)
-python proxy_pipeline.py --steps 1+2+3    # non-interactive
-python proxy_pipeline.py --steps 1+2 --custom-file my_nodes.txt
+python proxy-pipeline.py                  # interactive menu (TTY only)
+python proxy-pipeline.py --steps 1+2+3    # non-interactive
+python proxy-pipeline.py --steps 1+2 --custom-file my_nodes.txt
 ```
 
 ## CLI reference
@@ -112,7 +112,7 @@ python proxy_pipeline.py --steps 1+2 --custom-file my_nodes.txt
 3. The workflow needs `contents: write` (already declared below).
 4. Runs every 6 hours, or manually via **Actions → proxy-pipeline → Run workflow**.
 
-`.github/workflows/proxy.yml`:
+`.github/workflows/proxy-pipeline.yml`:
 
 ```yaml
 name: proxy-pipeline
@@ -149,7 +149,7 @@ jobs:
 
       - name: Run pipeline
         run: |
-          python proxy_pipeline.py \
+          python proxy-pipeline.py \
             --steps "${{ github.event.inputs.steps || '1+2+3' }}" \
             --time-budget 75
 
@@ -189,7 +189,7 @@ Filter by remark: keep `GEMINI`, treat `GEMERR` as "untested", avoid `NOGEMINI`.
 .
 ├── proxy_pipeline.py
 ├── sub_links.txt              # your subscription URLs
-├── .github/workflows/proxy.yml
+├── .github/workflows/proxy-pipeline.yml
 ├── ALIVE/
 │   ├── all.txt                # deduplicated source configs
 │   ├── working.txt            # configs that passed the endpoint test
