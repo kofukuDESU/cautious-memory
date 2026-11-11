@@ -1,6 +1,5 @@
-# Generated outputs — committed by the workflow, ignored locally
-ALIVE/
-logs/
+# Auto-installed xray binary — never commit
+bin/
 
 # Python
 __pycache__/
