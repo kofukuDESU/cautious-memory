@@ -1,33 +1,61 @@
 #!/usr/bin/env python3
 """
-Proxy config pipeline.
+Proxy config pipeline — GitHub Actions friendly edition.
 
 Steps:
-  1 = Fetch / custom file (source)
-  2 = Endpoint Test
-  3 = Enrich (Gemini + Geo + Reddit, no filtering)
+  1 = Fetch subscriptions / custom file (source)
+  2 = Endpoint test (xray + real HTTPS probes)
+  3 = Enrich (Gemini + Geo, no filtering)
+When 2 and 3 are both selected, they share ONE xray session per config.
 
-Outputs (Plain text in ./ALIVE/):
-  ALIVE/all.txt       → deduplicated source configs
-  ALIVE/working.txt   → configs that passed the endpoint test
-  ALIVE/enriched.txt  → every working config annotated with
-                        {flag}-{CC}-{GEMINI|NOGEMINI}-{REDDIT|NOREDDIT}
+Outputs (./ALIVE/):
+  all.txt      deduplicated source configs
+  working.txt  configs that passed the endpoint test
+  enriched.txt annotated configs:
+               {flag}-{CC}-{GEMINI|NOGEMINI|GEMERR}-{idx}
+               dead proxies (enrich-only mode) get {flag}-{CC}-DEAD-{idx}
+
+Label semantics:
+  GEMINI      tested, allowed
+  NOGEMINI    tested, geo-blocked
+  GEMERR      inconclusive (timeout, challenge, HTTP error, ...)
+  DEAD        proxy itself did not work
+
+CI behavior:
+  - Non-interactive: never prompts. On GitHub Actions, --steps defaults to 1+2+3
+    (override with --steps or env PROXY_STEPS).
+  - Auto-installs xray into ./bin/ if missing (disable: --no-install-xray,
+    pin with env XRAY_VERSION=v26.11.9, or point XRAY_BINARY at your own).
+  - Writes logs/summary.json and appends a report to $GITHUB_STEP_SUMMARY.
+  - --time-budget MINUTES stops testing gracefully so results still get saved.
+
+Requires: Python 3.10+, requests[socks]  (pip install "requests[socks]")
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
+import platform
+import random
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
+import zipfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
-from datetime import datetime
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -39,77 +67,65 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 LINKS_FILE = SCRIPT_DIR / "sub_links.txt"
 ALIVE_DIR = Path("ALIVE")
 LOG_DIR = Path("logs")
+BIN_DIR = SCRIPT_DIR / "bin"
 
-FETCH_TIMEOUT_SECONDS = 5
-RETRY_COUNT = 5
+FETCH_TIMEOUT = (5, 20)          # connect, read
+FETCH_RETRIES = 3
+FETCH_WORKERS = 8
+MAX_SUB_BYTES = 10_000_000       # 10 MB safety cap per subscription
+FETCH_PROXIES: dict | None = None
 
-PROXIES = None
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+)
+HEADERS = {"User-Agent": BROWSER_UA}
 
-XRAY_BINARY = "xray"
+XRAY_BIN = "xray"                # resolved / replaced at runtime
+XRAY_VERSION_STR = "unknown"
+XRAY_START_TIMEOUT = 5.0
+XRAY_START_ATTEMPTS = 3          # fresh port per attempt (port-race mitigation)
+
+# (url, expected status, required body marker or None)
 TEST_ENDPOINTS = [
-    "https://cp.cloudflare.com",
-    "https://www.gstatic.com",
-    "https://captive.apple.com",
+    ("https://cp.cloudflare.com/generate_204", 204, None),
+    ("https://www.gstatic.com/generate_204", 204, None),
+    ("https://captive.apple.com/hotspot-detect.html", 200, "success"),
 ]
-TEST_TIMEOUT = 1
-TEST_WORKERS = 50
+TEST_TIMEOUT = (3, 5)            # connect, read — through a proxy chain
+ENDPOINT_ROUNDS = 2              # one full retry round
+TEST_WORKERS = 20                # concurrent test workers (steps 2 and 3)
 
 # ---- Gemini check ----
-GEMINI_TEST_URL = "https://gemini.google.com/"
-GEMINI_TIMEOUT = 5
-GEMINI_BLOCKED_MARKER = "Gemini isn't currently supported in your country. Stay tuned!"
-
-# ---- Reddit check ----
-REDDIT_TEST_URL = "https://www.reddit.com/"
-REDDIT_TIMEOUT = (5, 8)
-REDDIT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-}
-REDDIT_MAX_CONCURRENT = 3
-REDDIT_MIN_INTERVAL_SECONDS = 0.5
-REDDIT_BODY_PREVIEW_CHARS = 350
-REDDIT_BLOCKED_MARKERS = (
-    "you've been blocked by network security",
-    "you have been blocked by network security",
-    "blocked by network security",
-    "if you think you've been blocked by mistake",
-)
+GEMINI_TEST_URL = "https://gemini.google.com/?hl=en"
+GEMINI_HEADERS = {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
+GEMINI_TIMEOUT = (5, 10)
+GEMINI_BLOCK_MARKERS = ("currently supported in your country",)
+BODY_PREVIEW_CHARS = 350
 
 # ---- Geo check ----
-GEO_ENRICH_URL = "http://ip-api.com/line/?fields=status,countryCode"
+GEO_TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"      # https, loc=CC
+GEO_FALLBACK_URL = "http://ip-api.com/line/?fields=status,countryCode"  # 45 req/min/IP
 GEO_TIMEOUT = 5
 
 CONFIG_RE = re.compile(
     r"(?:vmess|vless|trojan|ssr|ss|hysteria2|hysteria|hy2|tuic|wireguard|wg)://[^\s\"'<>`]+",
     re.IGNORECASE,
 )
+SUPPORTED_SCHEMES = {"vmess", "vless", "trojan", "ss"}
 
-STEP_SOURCE   = 1
+STEP_SOURCE = 1
 STEP_ENDPOINT = 2
-STEP_ENRICH   = 3
+STEP_ENRICH = 3
 
 IS_TTY = sys.stdout.isatty()
+IN_CI = bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI"))
 
-# Reddit rate-limiting primitives
-_REDDIT_SEMAPHORE = threading.BoundedSemaphore(REDDIT_MAX_CONCURRENT)
-_REDDIT_RATE_LOCK = threading.Lock()
-_REDDIT_LAST_REQUEST_START = 0.0
+STOP = threading.Event()
+DEADLINE: float | None = None    # monotonic deadline when --time-budget is used
+ALLOW_INSECURE = False           # honor allowInsecure=1 only with --allow-insecure
+
+SUMMARY: dict = {}
 
 
 # ---------------------------------------------------------------- helpers
@@ -120,6 +136,19 @@ def ensure_dirs() -> None:
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def deadline_exceeded() -> bool:
+    return DEADLINE is not None and time.monotonic() >= DEADLINE
+
+
+class TaskSkipped(Exception):
+    """Raised by workers when STOP is set or the time budget ran out."""
+
+
+def _check_stop() -> None:
+    if STOP.is_set() or deadline_exceeded():
+        raise TaskSkipped()
 
 
 def load_urls() -> list[str]:
@@ -138,22 +167,29 @@ def load_urls() -> list[str]:
 
 
 def b64decode_lenient(data: str) -> bytes:
-    data = "".join(data.split())
+    # Accept BOTH standard and URL-safe base64. b64decode(validate=False)
+    # silently DROPS '-' and '_' instead of translating them -> corruption.
+    data = "".join(data.split()).replace("-", "+").replace("_", "/")
     data += "=" * (-len(data) % 4)
     return base64.b64decode(data, validate=False)
 
 
 def normalize_to_text(raw: str) -> str:
-    if "://" in raw:
-        return raw
-    try:
-        decoded = b64decode_lenient(raw).decode("utf-8", errors="replace")
-        if "://" in decoded:
-            return decoded
-    except Exception:
-        pass
+    # Whole-body decode (up to 3 layers) only when no plaintext links exist.
+    text = raw
+    for _ in range(3):
+        if "://" in text:
+            break
+        try:
+            decoded = b64decode_lenient(text).decode("utf-8", errors="replace")
+        except Exception:
+            break
+        if "://" not in decoded:
+            break
+        text = decoded
+    # ALWAYS run the per-line pass: subscriptions can mix plain + b64 lines.
     out = []
-    for line in raw.splitlines():
+    for line in text.splitlines():
         s = line.strip()
         if not s or "://" in s:
             out.append(line)
@@ -170,27 +206,37 @@ def normalize_to_text(raw: str) -> str:
 
 
 def extract_configs(text: str) -> list[str]:
-    return [m.group(0).rstrip(".,;)]}'\"><") for m in CONFIG_RE.finditer(text)]
+    # Keep )]} — they are common inside remarks; strip only clear delimiters.
+    return [m.group(0).rstrip(".,;'\"<>`") for m in CONFIG_RE.finditer(text)]
 
 
-def fetch_with_retries(url: str, timeout: int, retry_count: int) -> tuple[bool, str]:
+def fetch_with_retries(url: str) -> tuple[bool, str]:
     last_error = ""
-    for attempt in range(1, retry_count + 1):
+    for attempt in range(1, FETCH_RETRIES + 1):
         try:
-            r = requests.get(url, headers=HEADERS, proxies=PROXIES, timeout=timeout)
-            r.raise_for_status()
-            text = r.text.strip()
-            if text:
-                return True, text
-            last_error = "Empty response"
+            with requests.get(url, headers=HEADERS, proxies=FETCH_PROXIES,
+                              timeout=FETCH_TIMEOUT, stream=True) as r:
+                r.raise_for_status()
+                chunks, size = [], 0
+                for chunk in r.iter_content(65536):
+                    size += len(chunk)
+                    if size > MAX_SUB_BYTES:
+                        raise ValueError("subscription exceeds size cap")
+                    chunks.append(chunk)
+                # Force UTF-8: requests defaults to ISO-8859-1 without charset,
+                # which mangles Persian/emoji remarks.
+                text = b"".join(chunks).decode("utf-8", errors="replace").strip()
+                if text:
+                    return True, text
+                last_error = "Empty response"
         except Exception as e:
-            last_error = str(e)
-        if attempt < retry_count:
-            time.sleep(1)
+            last_error = f"{type(e).__name__}: {e}"
+        if attempt < FETCH_RETRIES:
+            time.sleep(min(2 ** (attempt - 1), 8) + random.uniform(0, 0.5))
     return False, last_error
 
 
-# ---------------------------------------------------------------- remark handling
+# ---------------------------------------------------------------- remarks
 def country_flag(code: str) -> str:
     code = (code or "").upper()
     if len(code) != 2 or not code.isalpha():
@@ -214,15 +260,21 @@ def set_remark(uri: str, new_remark: str, protocol: str) -> str:
     return f"{base}#{quote(new_remark, safe='')}"
 
 
-def build_enriched_remark(gemini_ok: bool, reddit_ok: bool, country: str | None) -> str:
-    """Compose the final remark from the three test results, discarding the original."""
+def gemini_tag(res: SiteResult) -> str:
+    if res.ok:
+        return "GEMINI"
+    return "NOGEMINI" if res.category == "blocked" else "GEMERR"
+
+
+def build_enriched_remark(res: EnrichResult, idx: int) -> str:
     parts: list[str] = []
-    if country:
-        parts.append(f"{country_flag(country)}-{country}")
-    
-    parts.append("GEMINI" if gemini_ok else "NOGEMINI")
-    parts.append("REDDIT" if reddit_ok else "NOREDDIT")
-    
+    if res.country:
+        parts.append(f"{country_flag(res.country)}-{res.country}")
+    if res.dead:
+        parts.append("DEAD")
+    else:
+        parts.append(gemini_tag(res.gemini))
+    parts.append(f"{idx:03d}")   # unique per run -> no identical remarks
     return "-".join(parts)
 
 
@@ -246,6 +298,9 @@ def parse_vmess(uri: str) -> dict | None:
         aid = int(data.get("aid", 0) or 0)
     except (TypeError, ValueError):
         aid = 0
+    alpn = data.get("alpn", "")
+    if isinstance(alpn, list):                      # some JSON variants use lists
+        alpn = ",".join(str(a) for a in alpn)
     return {
         "protocol": "vmess", "address": data.get("add", ""), "port": port,
         "uuid": data.get("id", ""), "alterId": aid,
@@ -253,7 +308,7 @@ def parse_vmess(uri: str) -> dict | None:
         "network": data.get("net", "tcp") or "tcp",
         "headerType": data.get("type", ""), "host": data.get("host", ""),
         "path": data.get("path", "") or "/", "tls": data.get("tls", ""),
-        "sni": data.get("sni", ""), "alpn": data.get("alpn", ""),
+        "sni": data.get("sni", ""), "alpn": alpn or "",
         "fp": data.get("fp", ""), "remark": data.get("ps", ""),
     }
 
@@ -262,61 +317,93 @@ def parse_url_style(uri: str, protocol: str) -> dict | None:
     try:
         p = urlparse(uri)
         params = parse_qs(p.query)
+        # TLS is IMPLICIT for trojan; links often omit security=tls.
+        default_tls = "tls" if protocol == "trojan" else ""
+        insecure = _q(params, "allowInsecure", _q(params, "insecure", "")).lower() in ("1", "true")
         return {
             "protocol": protocol, "uuid": unquote(p.username or ""),
             "address": p.hostname or "", "port": p.port or 0,
             "remark": unquote(p.fragment or ""),
             "network": _q(params, "type", "tcp") or "tcp",
-            "tls": _q(params, "security", ""), "sni": _q(params, "sni", ""),
-            "host": _q(params, "host", ""), "path": _q(params, "path", "") or "/",
+            "tls": _q(params, "security", default_tls),
+            "sni": _q(params, "sni", ""), "host": _q(params, "host", ""),
+            "path": _q(params, "path", "") or "/",
             "fp": _q(params, "fp", ""), "alpn": _q(params, "alpn", ""),
             "flow": _q(params, "flow", ""),
             "serviceName": _q(params, "serviceName", ""),
             "pbk": _q(params, "pbk", ""), "sid": _q(params, "sid", ""),
-            "headerType": _q(params, "headerType", ""), "mode": _q(params, "mode", ""),
+            "spx": _q(params, "spx", ""),
+            "headerType": _q(params, "headerType", ""),
+            "mode": _q(params, "mode", ""),
+            "allowInsecure": insecure,
         }
     except Exception:
         return None
 
 
+def _split_host_port(s: str) -> tuple[str, int]:
+    s = s.strip()
+    if s.startswith("["):                           # [ipv6]:port
+        host, _, rest = s[1:].partition("]")
+        return host, int(rest.lstrip(":"))
+    host, port = s.rsplit(":", 1)
+    return host.strip("[]"), int(port)
+
+
 def parse_ss(uri: str) -> dict | None:
+    """Manual split (not urlparse) so base64 userinfo containing '/' or '+'
+    survives, and plaintext method:password userinfo is accepted too."""
     try:
-        p = urlparse(uri)
-        remark = unquote(p.fragment or "")
-        if p.username and p.hostname and p.port:
-            try:
-                method_pass = b64decode_lenient(unquote(p.username)).decode("utf-8", errors="replace")
-                if ":" in method_pass:
-                    method, password = method_pass.split(":", 1)
-                    return {
-                        "protocol": "ss", "address": p.hostname, "port": p.port,
-                        "method": method, "password": password, "remark": remark,
-                    }
-            except Exception:
-                pass
-        decoded = b64decode_lenient(uri[len("ss://"):].split("#", 1)[0]).decode(
-            "utf-8", errors="replace"
-        )
-        method_pass, host_port = decoded.rsplit("@", 1)
-        method, password = method_pass.split(":", 1)
-        host, port = host_port.rsplit(":", 1)
-        return {
-            "protocol": "ss", "address": host, "port": int(port),
-            "method": method, "password": password, "remark": remark,
+        body = uri[len("ss://"):].split("#", 1)[0]
+        remark = unquote(uri.partition("#")[2])
+        params: dict = {}
+        if "?" in body:
+            body, query = body.split("?", 1)
+            params = parse_qs(query)
+        base = {
+            "protocol": "ss", "remark": remark,
+            "plugin": _q(params, "plugin", ""),
+            "network": _q(params, "type", "tcp") or "tcp",
+            "tls": _q(params, "security", ""),
+            "sni": _q(params, "sni", ""), "host": _q(params, "host", ""),
+            "path": _q(params, "path", "") or "/",
+            "fp": _q(params, "fp", ""), "alpn": _q(params, "alpn", ""),
         }
+        if "@" in body:                             # SIP002
+            userinfo, hostport = body.rsplit("@", 1)
+            userinfo = unquote(userinfo)
+            if ":" in userinfo:                     # plaintext method:password
+                method, password = userinfo.split(":", 1)
+            else:                                   # base64(method:password)
+                decoded = b64decode_lenient(userinfo).decode("utf-8", errors="replace")
+                if ":" not in decoded:
+                    return None
+                method, password = decoded.split(":", 1)
+            address, port = _split_host_port(hostport)
+        else:                                       # legacy full-base64
+            decoded = b64decode_lenient(body).decode("utf-8", errors="replace")
+            method_pass, hostport = decoded.rsplit("@", 1)
+            method, password = method_pass.split(":", 1)
+            address, port = _split_host_port(hostport)
+        if not address or not method or not (0 < port < 65536):
+            return None
+        return {**base, "address": address, "port": port,
+                "method": method, "password": password}
     except Exception:
         return None
 
 
 def parse_config(uri: str) -> dict | None:
     uri = uri.strip()
-    try:
-        if uri.startswith("vmess://"):   return parse_vmess(uri)
-        if uri.startswith("vless://"):   return parse_url_style(uri, "vless")
-        if uri.startswith("trojan://"):  return parse_url_style(uri, "trojan")
-        if uri.startswith("ss://"):      return parse_ss(uri)
-    except Exception:
-        return None
+    scheme = uri.split("://", 1)[0].lower()         # regex is case-insensitive
+    if scheme == "vmess":
+        return parse_vmess(uri)
+    if scheme == "vless":
+        return parse_url_style(uri, "vless")
+    if scheme == "trojan":
+        return parse_url_style(uri, "trojan")
+    if scheme == "ss":
+        return parse_ss(uri)
     return None
 
 
@@ -324,36 +411,45 @@ def fingerprint(p: dict) -> tuple:
     return (
         p.get("protocol"), (p.get("address") or "").lower(), p.get("port"),
         p.get("uuid") or "", p.get("method") or "", p.get("password") or "",
-        p.get("network") or "", p.get("tls") or "", p.get("sni") or "",
-        p.get("host") or "", p.get("path") or "", p.get("serviceName") or "",
+        p.get("network") or "", p.get("tls") or "", (p.get("sni") or "").lower(),
+        (p.get("host") or "").lower(), p.get("path") or "", p.get("serviceName") or "",
         p.get("flow") or "", p.get("pbk") or "", p.get("sid") or "",
         p.get("headerType") or "", p.get("alterId") or 0,
+        p.get("security") or "", p.get("fp") or "", p.get("alpn") or "",
+        p.get("mode") or "", p.get("plugin") or "",
     )
 
 
-def parse_and_dedupe(raw_uris: list[str]) -> list[tuple[str, dict]]:
+def parse_and_dedupe(raw_uris: list[str]) -> tuple[list[tuple[str, dict]], Counter]:
     unique: list[tuple[str, dict]] = []
-    seen = set()
+    seen: set[tuple] = set()
+    skipped: Counter = Counter()
     for uri in raw_uris:
+        scheme = uri.split("://", 1)[0].lower()
+        if scheme not in SUPPORTED_SCHEMES:
+            skipped[scheme] += 1                    # hy2/tuic need sing-box, not xray
+            continue
         p = parse_config(uri)
         if not p:
+            skipped[f"{scheme} (parse failed)"] += 1
             continue
         fp = fingerprint(p)
         if fp in seen:
             continue
         seen.add(fp)
         unique.append((uri, p))
-    return unique
+    return unique, skipped
 
 
-def load_configs_from_file(path: Path) -> list[tuple[str, dict]]:
-    uris = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    return parse_and_dedupe(uris)
+def load_configs_from_file(path: Path) -> tuple[list[tuple[str, dict]], Counter]:
+    # Same normalization as the fetch path (b64 dumps, mixed lines, etc.)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return parse_and_dedupe(extract_configs(normalize_to_text(text)))
 
 
-# ---------------------------------------------------------------- xray
+# ---------------------------------------------------------------- xray config
 def build_stream(p: dict) -> dict:
-    network = p.get("network") or "tcp"
+    network = (p.get("network") or "tcp").lower()
     tls = p.get("tls") or ""
     host = p.get("host") or ""
     path = p.get("path") or "/"
@@ -365,7 +461,10 @@ def build_stream(p: dict) -> dict:
             ws["headers"] = {"Host": host}
         stream["wsSettings"] = ws
     elif network == "grpc":
-        stream["grpcSettings"] = {"serviceName": p.get("serviceName") or ""}
+        gs = {"serviceName": p.get("serviceName") or ""}
+        if p.get("mode") == "multi":
+            gs["multiMode"] = True
+        stream["grpcSettings"] = gs
     elif network in ("h2", "http"):
         stream["network"] = "h2"
         h2 = {"path": path}
@@ -380,9 +479,17 @@ def build_stream(p: dict) -> dict:
             }
         }
     elif network == "httpupgrade":
-        stream["httpupgradeSettings"] = {"path": path, "host": host}
+        hu = {"path": path}
+        if host:
+            hu["host"] = host
+        stream["httpupgradeSettings"] = hu
     elif network == "xhttp":
-        stream["xhttpSettings"] = {"path": path, "host": host, "mode": p.get("mode") or ""}
+        xs = {"path": path}
+        if host:
+            xs["host"] = host
+        if p.get("mode"):
+            xs["mode"] = p["mode"]
+        stream["xhttpSettings"] = xs
 
     if tls == "tls":
         ts = {}
@@ -392,24 +499,24 @@ def build_stream(p: dict) -> dict:
         if p.get("fp"):
             ts["fingerprint"] = p["fp"]
         if p.get("alpn"):
-            ts["alpn"] = [a.strip() for a in p["alpn"].split(",") if a.strip()]
+            ts["alpn"] = [a.strip() for a in str(p["alpn"]).split(",") if a.strip()]
+        if ALLOW_INSECURE and p.get("allowInsecure"):
+            ts["allowInsecure"] = True
         stream["security"] = "tls"
         stream["tlsSettings"] = ts
     elif tls == "reality":
-        rs = {}
+        # REALITY needs a uTLS fingerprint; default to chrome when absent.
+        rs = {"fingerprint": p.get("fp") or "chrome", "publicKey": p.get("pbk") or ""}
         if p.get("sni"):
             rs["serverName"] = p["sni"]
-        if p.get("fp"):
-            rs["fingerprint"] = p["fp"]
-        if p.get("pbk"):
-            rs["publicKey"] = p["pbk"]
         if p.get("sid"):
             rs["shortId"] = p["sid"]
+        if p.get("spx"):
+            rs["spiderX"] = p["spx"]
         stream["security"] = "reality"
         stream["realitySettings"] = rs
     else:
         stream["security"] = "none"
-
     return stream
 
 
@@ -421,8 +528,17 @@ def build_outbound(p: dict) -> dict | None:
         port = int(p["port"])
     except (TypeError, ValueError):
         return None
+    if not (0 < port < 65536):
+        return None
+    network = (p.get("network") or "tcp").lower()
+    if network in ("kcp", "mkcp", "quic"):
+        return None                                 # settings not recoverable from links
+    if p.get("tls") == "reality" and not p.get("pbk"):
+        return None                                 # REALITY without key cannot work
 
     if proto in ("vmess", "vless"):
+        if not p.get("uuid"):
+            return None
         user: dict = {"id": p["uuid"]}
         if proto == "vmess":
             user["alterId"] = int(p.get("alterId") or 0)
@@ -437,22 +553,31 @@ def build_outbound(p: dict) -> dict | None:
             "streamSettings": build_stream(p),
         }
     if proto == "trojan":
+        if not p.get("uuid"):
+            return None
         return {
             "protocol": "trojan",
-            "settings": {"servers": [{"address": p["address"], "port": port, "password": p["uuid"]}]},
+            "settings": {"servers": [{"address": p["address"], "port": port,
+                                      "password": p["uuid"]}]},
             "streamSettings": build_stream(p),
         }
     if proto == "ss":
+        if p.get("plugin"):
+            return None                             # SIP003 plugins unsupported by xray
+        if not p.get("method") or not p.get("password"):
+            return None
         return {
             "protocol": "shadowsocks",
             "settings": {"servers": [{
                 "address": p["address"], "port": port,
                 "method": p["method"], "password": p["password"],
             }]},
+            "streamSettings": build_stream(p),
         }
     return None
 
 
+# ---------------------------------------------------------------- xray process
 def free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -461,61 +586,153 @@ def free_port() -> int:
     return port
 
 
-def wait_port(port: int, timeout: float = 5.0) -> bool:
-    start = time.time()
-    while time.time() - start < timeout:
+def wait_port(proc: subprocess.Popen, port: int, timeout: float = 5.0) -> bool:
+    """Wait until OUR xray answers a SOCKS5 greeting on the port.
+    Bails out immediately if the process died (bad config)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.4):
-                return True
+            with socket.create_connection(("127.0.0.1", port), timeout=0.4) as s:
+                s.settimeout(0.4)
+                s.sendall(b"\x05\x01\x00")          # SOCKS5 hello, no-auth
+                if s.recv(2) == b"\x05\x00":
+                    return True
         except OSError:
-            time.sleep(0.1)
+            pass
+        time.sleep(0.05)
     return False
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 @contextmanager
 def xray_proxy(p: dict):
     outbound = build_outbound(p)
-    if not outbound:
+    if outbound is None:
         yield None
         return
-
-    port = free_port()
-    cfg = {
-        "log": {"loglevel": "none"},
-        "inbounds": [{
-            "port": port, "listen": "127.0.0.1",
-            "protocol": "socks", "settings": {"udp": False},
-        }],
-        "outbounds": [outbound],
-    }
-
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(prefix="xray_") as tmp:
         cfg_path = Path(tmp) / "c.json"
-        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
-        proc = subprocess.Popen(
-            [XRAY_BINARY, "run", "-c", str(cfg_path)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        try:
-            if not wait_port(port, 5.0):
-                yield None
+        for _attempt in range(XRAY_START_ATTEMPTS):
+            if STOP.is_set():
+                break
+            port = free_port()                      # fresh port each attempt
+            cfg = {
+                "log": {"loglevel": "none"},
+                "inbounds": [{
+                    "port": port, "listen": "127.0.0.1",
+                    "protocol": "socks", "settings": {"udp": False},
+                }],
+                "outbounds": [outbound],
+            }
+            cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+            proc = subprocess.Popen(
+                [XRAY_BIN, "run", "-c", str(cfg_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if wait_port(proc, port, XRAY_START_TIMEOUT):
+                proxy_url = f"socks5h://127.0.0.1:{port}"
+                try:
+                    yield {"http": proxy_url, "https": proxy_url}
+                finally:
+                    _terminate(proc)
                 return
-            proxy_url = f"socks5h://127.0.0.1:{port}"
-            yield {"http": proxy_url, "https": proxy_url}
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            _terminate(proc)                        # died or port stolen -> retry
+        yield None
 
 
-def xray_available() -> bool:
+def _xray_asset_name() -> str | None:
+    system = platform.system()
+    machine = platform.machine().lower()
+    arm = machine in ("arm64", "aarch64")
+    if system == "Linux":
+        return "Xray-linux-arm64-v8a.zip" if arm else "Xray-linux-64.zip"
+    if system == "Darwin":
+        return "Xray-macos-arm64-v8a.zip" if arm else "Xray-macos-64.zip"
+    if system == "Windows":
+        return "Xray-windows-arm64-v8a.zip" if arm else "Xray-windows-64.zip"
+    return None
+
+
+def install_xray() -> str | None:
+    asset = _xray_asset_name()
+    if asset is None:
+        log("ERROR: no known xray release asset for this platform.")
+        return None
+    version = os.environ.get("XRAY_VERSION", "").strip()
+    if version and version.lower() != "latest":
+        url = f"https://github.com/XTLS/Xray-core/releases/download/{version}/{asset}"
+    else:
+        url = f"https://github.com/XTLS/Xray-core/releases/latest/download/{asset}"
+    log(f"Installing xray: {url}")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    data = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(url, headers=HEADERS, proxies=FETCH_PROXIES, timeout=(10, 120))
+            r.raise_for_status()
+            data = r.content
+            break
+        except Exception as e:
+            log(f"  xray download attempt {attempt} failed: {e}")
+            if attempt < 3:
+                time.sleep(2 * attempt)
+    if not data:
+        return None
+    exe = "xray.exe" if os.name == "nt" else "xray"
     try:
-        r = subprocess.run([XRAY_BINARY, "version"], capture_output=True, timeout=5)
-        return r.returncode == 0
-    except (FileNotFoundError, subprocess.SubprocessError):
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            member = next(n for n in zf.namelist() if Path(n).name == exe)
+            target = BIN_DIR / exe
+            target.write_bytes(zf.read(member))
+        target.chmod(0o755)
+    except Exception as e:
+        log(f"ERROR: failed to extract xray: {e}")
+        return None
+    return str(target)
+
+
+def ensure_xray_ready(auto_install: bool) -> bool:
+    global XRAY_BIN, XRAY_VERSION_STR
+    cand = os.environ.get("XRAY_BINARY") or XRAY_BIN
+    path = shutil.which(cand)
+    if path is None and Path(cand).is_file():
+        path = str(Path(cand).resolve())
+    if path is None:
+        local = BIN_DIR / ("xray.exe" if os.name == "nt" else "xray")
+        if local.is_file():
+            path = str(local)
+    if path is None and auto_install:
+        path = install_xray()
+    if path is None:
+        log("ERROR: xray binary not found. Install it, set XRAY_BINARY, or allow auto-install.")
         return False
+    try:
+        r = subprocess.run([path, "version"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or "").strip() or "xray version failed")
+        XRAY_VERSION_STR = (r.stdout.splitlines() or ["unknown"])[0]
+    except Exception as e:
+        log(f"ERROR: xray not usable: {e}")
+        return False
+    XRAY_BIN = path
+    SUMMARY["xray"] = XRAY_VERSION_STR
+    log(f"Using {XRAY_VERSION_STR} ({path})")
+    return True
 
 
 def socks_support_available() -> bool:
@@ -526,19 +743,50 @@ def socks_support_available() -> bool:
         return False
 
 
+# ---------------------------------------------------------------- results
+@dataclass
+class SiteResult:
+    ok: bool
+    status: str
+    category: str        # allowed / blocked / challenge / http_error / unreachable ...
+    details: str = ""
+
+
+@dataclass
+class EnrichResult:
+    gemini: SiteResult
+    country: str | None = None
+    dead: bool = False
+
+    @classmethod
+    def make_dead(cls, reason: str) -> EnrichResult:
+        return cls(SiteResult(False, reason, "proxy_dead"), None, True)
+
+
+@dataclass
+class Outcome:
+    alive: bool
+    enrich: EnrichResult | None = None
+
+
 # ---------------------------------------------------------------- tests
-def test_endpoints(p: dict) -> bool:
-    with xray_proxy(p) as proxies:
-        if proxies is None:
-            return False
-        for url in TEST_ENDPOINTS:
-            try:
-                r = requests.get(url, proxies=proxies, timeout=TEST_TIMEOUT, allow_redirects=True)
-                if r.status_code >= 500:
-                    return False
-            except requests.RequestException:
+def endpoint_check(proxies: dict) -> bool:
+    """Any expected-status probe passing = alive. One full retry round."""
+    for _round in range(ENDPOINT_ROUNDS):
+        for url, expected, marker in TEST_ENDPOINTS:
+            if STOP.is_set() or deadline_exceeded():
                 return False
-        return True
+            try:
+                r = requests.get(url, proxies=proxies, timeout=TEST_TIMEOUT,
+                                 allow_redirects=False)
+            except requests.RequestException:
+                continue
+            if r.status_code != expected:
+                continue
+            if marker and marker not in (r.text or "").lower():
+                continue
+            return True
+    return False
 
 
 def _normalize_for_match(s: str) -> str:
@@ -548,28 +796,10 @@ def _normalize_for_match(s: str) -> str:
     )
 
 
-def is_gemini_blocked(body: str) -> bool:
-    return _normalize_for_match(GEMINI_BLOCKED_MARKER) in _normalize_for_match(body)
-
-
-# --- Reddit Specific Helpers ---
-def find_reddit_block_marker(body: str) -> str | None:
-    normalized = _normalize_for_match(unescape(body or ""))
-    for marker in REDDIT_BLOCKED_MARKERS:
-        normalized_marker = _normalize_for_match(marker)
-        if normalized_marker in normalized:
-            return marker
-    return None
-
-
-def _reddit_rate_limit() -> None:
-    global _REDDIT_LAST_REQUEST_START
-    with _REDDIT_RATE_LOCK:
-        now = time.monotonic()
-        delay = REDDIT_MIN_INTERVAL_SECONDS - (now - _REDDIT_LAST_REQUEST_START)
-        if delay > 0:
-            time.sleep(delay)
-        _REDDIT_LAST_REQUEST_START = time.monotonic()
+def _gemini_normalize(body: str) -> str:
+    body = unescape(body or "")
+    body = body.replace("\\u0027", "'").replace("\\x27", "'").replace("\\u2019", "'")
+    return _normalize_for_match(body)
 
 
 def _response_excerpt(body: str, marker: str | None = None) -> str:
@@ -583,147 +813,99 @@ def _response_excerpt(body: str, marker: str | None = None) -> str:
         if pos >= 0:
             start = max(0, pos - 100)
             end = min(len(text), pos + len(marker) + 180)
-            return text[start:end][:REDDIT_BODY_PREVIEW_CHARS]
-    return text[:REDDIT_BODY_PREVIEW_CHARS]
+            return text[start:end][:BODY_PREVIEW_CHARS]
+    return text[:BODY_PREVIEW_CHARS]
 
 
-def classify_reddit_response(response: requests.Response) -> tuple[bool, str, str, str]:
-    body = response.text or ""
-    marker = find_reddit_block_marker(body)
-    status_code = response.status_code
-    content_type = response.headers.get("Content-Type", "unknown")
-    final_url = response.url
-    elapsed = getattr(getattr(response, "elapsed", None), "total_seconds", lambda: 0.0)()
-    body_bytes = len(response.content or b"")
-
-    history = getattr(response, "history", []) or []
-    redirect_chain = " -> ".join([item.url for item in history] + [final_url])
-    detail_parts = [
-        f"HTTP {status_code}", f"redirect_chain={redirect_chain}",
-        f"final_url={final_url}", f"content_type={content_type}",
-        f"elapsed={elapsed:.2f}s", f"body_bytes={body_bytes}",
-    ]
-    for header in ("Server", "Retry-After", "X-Ratelimit-Used", "X-Ratelimit-Remaining", "X-Ratelimit-Reset", "X-Reddit-Request-Id"):
-        value = response.headers.get(header)
-        if value:
-            detail_parts.append(f"{header}={value}")
-    if marker:
-        detail_parts.append(f"matched_marker={marker!r}")
-    detail_parts.append(f"body_excerpt={_response_excerpt(body, marker)!r}")
-    details = " | ".join(detail_parts)
-
-    if marker:
-        return False, f"Confirmed network-security block (HTTP {status_code})", details, "security_block"
-    if status_code == 429:
-        return False, "Rate limited (HTTP 429)", details, "rate_limited"
-    if status_code == 403:
-        return False, "HTTP 403 (no recognized security marker)", details, "unclassified_403"
-    if status_code == 401:
-        return False, "Authentication required (HTTP 401)", details, "login_required"
-    if status_code >= 500:
-        return False, f"Reddit server error (HTTP {status_code})", details, "http_error"
-    if status_code >= 400:
-        return False, f"HTTP error {status_code}", details, "http_error"
-    if 200 <= status_code < 300:
-        if not body.strip():
-            return False, f"Empty response body (HTTP {status_code})", details, "other"
-        final_path = urlparse(final_url).path.lower().rstrip("/")
-        if final_path.startswith(("/login", "/account/login", "/register")):
-            return False, f"Login page returned (HTTP {status_code})", details, "login_required"
-        normalized_content_type = content_type.lower()
-        if normalized_content_type != "unknown" and not any(
-            kind in normalized_content_type for kind in ("text/html", "application/xhtml+xml")
-        ):
-            return False, f"Unexpected content type ({content_type})", details, "other"
-        return True, f"Allowed (HTTP {status_code})", details, "allowed"
-    if 300 <= status_code < 400:
-        return False, f"Unresolved redirect (HTTP {status_code})", details, "other"
-    return False, f"Unexpected HTTP status {status_code}", details, "other"
-
-
-def reddit_request(proxies: dict | None = None) -> tuple[bool, str, str, str]:
-    with _REDDIT_SEMAPHORE:
-        _reddit_rate_limit()
-        response = requests.get(
-            REDDIT_TEST_URL,
-            headers=REDDIT_HEADERS,
-            proxies=proxies,
-            timeout=REDDIT_TIMEOUT,
-            allow_redirects=True,
-        )
-    return classify_reddit_response(response)
-
-
-def reddit_direct_control() -> tuple[str, str]:
+def gemini_request(proxies: dict) -> SiteResult:
     try:
-        with requests.Session() as session:
-            session.trust_env = False
-            response = session.get(
-                REDDIT_TEST_URL, headers=REDDIT_HEADERS,
-                timeout=REDDIT_TIMEOUT, allow_redirects=True,
-            )
-        _, status, details, _ = classify_reddit_response(response)
-        return status, details
-    except requests.RequestException as exc:
-        return f"Unreachable: {type(exc).__name__}: {exc}", f"direct_runner_exception={exc!r}"
+        r = requests.get(GEMINI_TEST_URL, headers=GEMINI_HEADERS, proxies=proxies,
+                         timeout=GEMINI_TIMEOUT, allow_redirects=True)
+    except requests.RequestException as e:
+        return SiteResult(False, f"Unreachable: {type(e).__name__}: {e}",
+                          "unreachable", f"request_exception={e!r}")
+    body = r.text or ""
+    norm = _gemini_normalize(body)
+    final = urlparse(r.url)
+    host = (final.hostname or "").lower()
+    fpath = final.path.lower()
+    marker = next((m for m in GEMINI_BLOCK_MARKERS
+                   if _normalize_for_match(m) in norm), None)
+    details = (
+        f"HTTP {r.status_code} | final_url={r.url} | "
+        f"content_type={r.headers.get('Content-Type', 'unknown')} | "
+        f"body_excerpt={_response_excerpt(body, marker)!r}"
+    )
+    if (host.startswith(("consent.google.", "sorry.google."))
+            or fpath.startswith("/sorry") or "unusual traffic" in norm):
+        return SiteResult(False, f"Challenge/consent page ({host})", "challenge", details)
+    if marker:
+        return SiteResult(False, "Geo-blocked", "blocked",
+                          details + f" | matched_marker={marker!r}")
+    if r.status_code >= 400:
+        return SiteResult(False, f"HTTP {r.status_code}", "http_error", details)
+    if 200 <= r.status_code < 300:
+        return SiteResult(True, f"Allowed (HTTP {r.status_code})", "allowed", details)
+    return SiteResult(False, f"Unexpected HTTP {r.status_code}", "other", details)
 
 
-# ---------------------------------------------------------------- enrich test
-def test_enrich(p: dict) -> tuple[bool, bool, str | None, str, str, str, str]:
-    """Combined Gemini + Reddit + Geo check within a single xray session.
-    
-    Returns (gemini_ok, reddit_ok, country, gemini_status, reddit_status, reddit_details, reddit_category).
-    """
+def geo_lookup(proxies: dict) -> str | None:
+    # Primary: Cloudflare trace over HTTPS (no third-party rate limit,
+    # and a malicious exit cannot fake it like plaintext ip-api).
+    try:
+        r = requests.get(GEO_TRACE_URL, proxies=proxies, timeout=GEO_TIMEOUT)
+        if r.status_code == 200:
+            fields = dict(ln.split("=", 1) for ln in r.text.splitlines() if "=" in ln)
+            cc = (fields.get("loc") or "").strip().upper()
+            if len(cc) == 2 and cc.isalpha():
+                return cc
+    except requests.RequestException:
+        pass
+    try:
+        r = requests.get(GEO_FALLBACK_URL, proxies=proxies, timeout=GEO_TIMEOUT)
+        if r.status_code == 200:
+            lines = [ln.strip() for ln in r.text.strip().splitlines()]
+            if len(lines) >= 2 and lines[0].lower() == "success":
+                cc = lines[1].upper()
+                if len(cc) == 2 and cc.isalpha():
+                    return cc
+    except requests.RequestException:
+        pass
+    return None
+
+
+def enrich_with_proxies(proxies: dict) -> EnrichResult:
+    gemini = gemini_request(proxies)
+    country = geo_lookup(proxies)
+    return EnrichResult(gemini, country)
+
+
+def test_worker(p: dict, do_endpoint: bool, do_enrich: bool) -> Outcome:
+    _check_stop()
     with xray_proxy(p) as proxies:
         if proxies is None:
-            return (False, False, None, "Proxy failed", "Proxy failed", "", "unreachable")
-
-        # --- 1. Gemini ---
-        gemini_ok = False
-        gemini_status = "Unknown error"
+            _check_stop()
+            return Outcome(False, EnrichResult.make_dead("Proxy startup failed")
+                           if do_enrich else None)
+        if do_endpoint:
+            if not endpoint_check(proxies):
+                return Outcome(False)
+        elif do_enrich:
+            # Enrich-only mode: cheap liveness probe so dead nodes get DEAD,
+            # not a misleading NOGEMINI.
+            if not endpoint_check(proxies):
+                return Outcome(False, EnrichResult.make_dead("Endpoint probe failed"))
+        if not do_enrich:
+            return Outcome(True)
         try:
-            g = requests.get(
-                GEMINI_TEST_URL, proxies=proxies,
-                timeout=GEMINI_TIMEOUT, allow_redirects=True,
-            )
-            if g.status_code >= 400:
-                gemini_status = f"HTTP {g.status_code}"
-            elif is_gemini_blocked(g.text or ""):
-                gemini_status = "Geo-blocked"
-            else:
-                gemini_ok = True
-                gemini_status = "Allowed"
-        except requests.RequestException as e:
-            gemini_status = f"Unreachable: {e}"
-
-        # --- 2. Reddit ---
-        reddit_ok = False
-        reddit_details = ""
-        reddit_category = "other"
-        try:
-            reddit_ok, reddit_status, reddit_details, reddit_category = reddit_request(proxies)
-        except requests.RequestException as e:
-            reddit_status = f"Unreachable: {type(e).__name__}: {e}"
-            reddit_details = f"request_exception={e!r}"
-            reddit_category = "unreachable"
-
-        # --- 3. Geo ---
-        country = None
-        try:
-            r = requests.get(GEO_ENRICH_URL, proxies=proxies, timeout=GEO_TIMEOUT)
-            if r.status_code == 200:
-                lines = [ln.strip() for ln in r.text.strip().splitlines()]
-                if len(lines) >= 2 and lines[0].lower() == "success":
-                    cc = lines[1].upper()
-                    if len(cc) == 2 and cc.isalpha():
-                        country = cc
-        except requests.RequestException:
-            pass
-
-        return (gemini_ok, reddit_ok, country, gemini_status, reddit_status, reddit_details, reddit_category)
+            res = enrich_with_proxies(proxies)      # same session as step 2
+        except Exception as e:
+            res = EnrichResult(SiteResult(False, f"Test exception: {type(e).__name__}: {e}",
+                                          "other"))
+        return Outcome(True, res)
 
 
-# ---------------------------------------------------------------- progress
+# ---------------------------------------------------------------- progress / io
 def _render_bar(prefix: str, done: int, total: int, start: float, extra: str) -> None:
     pct = done / total if total else 1.0
     filled = int(30 * pct)
@@ -732,7 +914,7 @@ def _render_bar(prefix: str, done: int, total: int, start: float, extra: str) ->
     eta = (elapsed / done) * (total - done) if done else 0.0
     if not IS_TTY:
         if done % 50 == 0 or done == total:
-            print(f"  {prefix} {done}/{total}  {extra}")
+            print(f"  {prefix} {done}/{total}  {extra}", flush=True)
         return
     sys.stdout.write(
         f"\r  {prefix} [{bar}] {done}/{total} ({pct * 100:5.1f}%)  {extra}  ETA {eta:4.0f}s\x1b[K"
@@ -746,27 +928,89 @@ def _endline() -> None:
         sys.stdout.flush()
 
 
-# ---------------------------------------------------------------- persistence
 def _write(path: Path, uris: list[str]) -> None:
     path.write_text("\n".join(uris) + ("\n" if uris else ""), encoding="utf-8")
 
 
-def _append_line(path: Path, line: str) -> None:
-    with path.open("a", encoding="utf-8", newline="\n") as f:
-        f.write(line + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+class LineWriter:
+    """Incremental, crash-safe output. Flush per line, fsync once on close."""
+
+    def __init__(self, path: Path):
+        self._f = path.open("w", encoding="utf-8", newline="\n")
+
+    def write(self, line: str) -> None:
+        self._f.write(line + "\n")
+        self._f.flush()
+
+    def __enter__(self) -> LineWriter:
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        try:
+            self._f.flush()
+            os.fsync(self._f.fileno())
+        finally:
+            self._f.close()
+        return False
 
 
-# ---------------------------------------------------------------- interactive prompts
+def _write_enrich_diagnostics(path: Path, entries: list[tuple[str, EnrichResult]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        for i, (uri, res) in enumerate(entries, 1):
+            f.write(f"[{i}] URI: {uri}\n")
+            f.write(f"Country: {res.country or 'unknown'}\n")
+            if res.dead:
+                f.write(f"DEAD: {res.gemini.status}\n")
+            else:
+                f.write(f"Gemini: {res.gemini.status} [{res.gemini.category}]\n")
+                f.write(f"Gemini details: {res.gemini.details}\n")
+            f.write("-" * 80 + "\n")
+
+
+def write_summary_files(duration_s: float) -> None:
+    SUMMARY["duration_s"] = round(duration_s, 1)
+    SUMMARY["timestamp_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        (LOG_DIR / "summary.json").write_text(
+            json.dumps(SUMMARY, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    gh = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not gh:
+        return
+    lines = ["## Proxy pipeline", "",
+             f"- Steps: `{SUMMARY.get('steps')}`",
+             f"- Xray: `{SUMMARY.get('xray', 'n/a')}`",
+             f"- Duration: {SUMMARY['duration_s']}s", ""]
+    src = SUMMARY.get("source")
+    if src:
+        lines += [f"**Source:** {src['unique']} unique / {src['raw']} raw configs"
+                  f" ({src['failed_urls']} URLs failed)", ""]
+    ep = SUMMARY.get("endpoint")
+    if ep:
+        lines += ["### Endpoint test", "",
+                  "| PASS | FAIL | Unsupported | Skipped |", "|---|---|---|---|",
+                  f"| {ep['pass']} | {ep['fail']} | {ep['unsupported']} | {ep['skipped']} |", ""]
+    en = SUMMARY.get("enrich")
+    if en:
+        g = en["gemini"]
+        lines += ["### Enrich", "",
+                  "| GEMINI | NOGEMINI | GEMERR | DEAD |", "|---|---|---|---|",
+                  f"| {g['GEMINI']} | {g['NOGEMINI']} | {g['GEMERR']} | {en['dead']} |", ""]
+    try:
+        with open(gh, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- interactive (local only)
 def prompt_steps() -> set[int] | None:
-    print()
-    print("Select steps (combine with '+'):")
+    print("\nSelect steps (combine with '+'):")
     print("  1 = Fetch / custom file (source)")
     print("  2 = Endpoint Test")
-    print("  3 = Enrich (Gemini + Geo + Reddit)")
-    print()
-    print("Examples: 1  |  1+2  |  1+2+3")
+    print("  3 = Enrich (Gemini + Geo)")
+    print("\nExamples: 1  |  1+2  |  1+2+3")
     while True:
         try:
             ans = input("Steps to run: ").strip()
@@ -802,8 +1046,7 @@ def _parse_steps(s: str) -> set[int]:
 
 
 def prompt_source() -> tuple[str, Path | None] | None:
-    print()
-    print("Source:")
+    print("\nSource:")
     print("  [1] Fetch subscription URLs (sub_links.txt)  (default)")
     print("  [2] Custom config file (.txt)")
     while True:
@@ -823,9 +1066,7 @@ def prompt_source() -> tuple[str, Path | None] | None:
 
 
 def prompt_custom_file() -> Path | None:
-    print()
-    print(f"Custom config file (.txt). Looked up in:")
-    print(f"  {SCRIPT_DIR}")
+    print(f"\nCustom config file (.txt). Looked up in:\n  {SCRIPT_DIR}")
     while True:
         try:
             name = input("Filename: ").strip()
@@ -854,22 +1095,28 @@ def run_source_fetch() -> list[tuple[str, dict]] | None:
         log(f"[Step 1] ERROR: {LINKS_FILE} contains no URLs.")
         return None
 
+    results: dict[str, tuple[bool, str]] = {}
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        futs = {ex.submit(fetch_with_retries, u): u for u in urls}
+        for f in as_completed(futs):
+            results[futs[f]] = f.result()
+
     raw_uris: list[str] = []
     failures: list[tuple[str, str]] = []
     for url in urls:
-        log(f"[Step 1] Fetching: {url}")
-        ok, content = fetch_with_retries(url, FETCH_TIMEOUT_SECONDS, RETRY_COUNT)
+        ok, content = results[url]
         if not ok:
             failures.append((url, content))
-            log(f"[Step 1]   FAILED: {content}")
+            log(f"[Step 1]   FAILED {url}: {content}")
             continue
         extracted = extract_configs(normalize_to_text(content))
-        log(f"[Step 1]   {len(extracted)} configs")
+        log(f"[Step 1]   {len(extracted):5d} configs  {url}")
         raw_uris.extend(extracted)
 
-    unique = parse_and_dedupe(raw_uris)
+    unique, skipped = parse_and_dedupe(raw_uris)
     log(f"[Step 1] Total: {len(raw_uris)}  Unique: {len(unique)}")
-
+    if skipped:
+        log("[Step 1]   Skipped: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
     _write(ALIVE_DIR / "all.txt", [u for u, _ in unique])
     log(f"[Step 1] Saved: {ALIVE_DIR / 'all.txt'}")
 
@@ -880,288 +1127,263 @@ def run_source_fetch() -> list[tuple[str, dict]] | None:
                 f.write(f"[{i}] {url}\nERROR: {err}\n{'-' * 80}\n")
         log(f"[Step 1] Saved failure log: {fail_log}")
 
+    SUMMARY["source"] = {"urls": len(urls), "failed_urls": len(failures),
+                         "raw": len(raw_uris), "unique": len(unique),
+                         "skipped": dict(skipped)}
     return unique
 
 
 def run_source_custom(path: Path) -> list[tuple[str, dict]] | None:
-    log(f"[Step 1] Custom config file: {path.name}")
-    configs = load_configs_from_file(path)
+    log(f"[Step 1] Custom config file: {path}")
+    configs, skipped = load_configs_from_file(path)
     log(f"[Step 1] Loaded {len(configs)} unique configs")
+    if skipped:
+        log("[Step 1]   Skipped: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
     _write(ALIVE_DIR / "all.txt", [u for u, _ in configs])
     log(f"[Step 1] Saved: {ALIVE_DIR / 'all.txt'}")
+    SUMMARY["source"] = {"custom_file": str(path), "raw": len(configs),
+                         "unique": len(configs), "failed_urls": 0,
+                         "skipped": dict(skipped)}
     return configs
 
 
-def run_endpoint_test(configs: list[tuple[str, dict]]) -> list[tuple[str, dict]] | None:
-    log("[Step 2] Endpoint Test")
-    testable, skipped = [], 0
-    for uri, p in configs:
-        if build_outbound(p) is None:
-            skipped += 1
-        else:
-            testable.append((uri, p))
-    if skipped:
-        log(f"[Step 2]   {skipped} configs skipped (unsupported protocol)")
-
-    if not xray_available():
-        log("[Step 2] WARNING: xray binary not available.")
-        return None
-
-    out_path = ALIVE_DIR / "working.txt"
-    out_path.write_text("", encoding="utf-8")
-
-    log(f"[Step 2] Testing {len(testable)} configs (workers={TEST_WORKERS})...")
-    passed_pairs: list[tuple[str, dict]] = []
-    passed_uris: list[str] = []
-    passed = failed = 0
-    start = time.time()
-
-    def record(uri: str, p: dict) -> None:
-        passed_uris.append(uri)
-        passed_pairs.append((uri, p))
-        _append_line(out_path, uri)
-
-    with ThreadPoolExecutor(max_workers=TEST_WORKERS) as ex:
-        futures = {ex.submit(test_endpoints, p): (uri, p) for uri, p in testable}
-        done = 0
-        for fut in as_completed(futures):
-            done += 1
-            uri, p = futures[fut]
-            try:
-                if fut.result():
-                    record(uri, p); passed += 1
-                else:
-                    failed += 1
-            except Exception as e:
-                failed += 1
-                _endline()
-                log(f"[Step 2]   ERR {uri[:70]}: {e}")
-            _render_bar("Step 2", done, len(testable), start,
-                        f"PASS {passed}  FAIL {failed}  SKIP {skipped}")
-    _endline()
-
-    elapsed = time.time() - start
-    log(f"[Step 2] Done in {elapsed:.0f}s — PASS {passed}  FAIL {failed}  SKIP {skipped}")
-    log(f"[Step 2] Saved: {out_path}  ({len(passed_pairs)} configs)")
-    return passed_pairs
-
-
-def run_enrich(configs: list[tuple[str, dict]]) -> list[tuple[str, dict]] | None:
-    """Step 3 — annotate every config with geo + Gemini + Reddit."""
-    log("[Step 3] Enrich (geo + Gemini + Reddit)")
-    if not configs:
-        log("[Step 3] No configs to enrich.")
+def run_tests(configs: list[tuple[str, dict]], do_endpoint: bool, do_enrich: bool,
+              args: argparse.Namespace) -> list[tuple[str, dict]] | None:
+    label = ("Step 2+3" if do_endpoint and do_enrich
+             else "Step 2" if do_endpoint else "Step 3")
+    log(f"[{label}] " + ("Endpoint test + Enrich (shared xray sessions)"
+                         if do_endpoint and do_enrich
+                         else "Endpoint Test" if do_endpoint
+                         else "Enrich (Gemini + Geo)"))
+    testable = [(u, p) for u, p in configs if build_outbound(p) is not None]
+    unsupported = len(configs) - len(testable)
+    if unsupported:
+        log(f"[{label}]   {unsupported} configs skipped (unsupported protocol/network/plugin)")
+    if not testable:
+        log(f"[{label}] Nothing testable.")
         return []
-    if not xray_available():
-        log("[Step 3] WARNING: xray binary not available.")
-        return None
 
-    out_path = ALIVE_DIR / "enriched.txt"
-    out_path.write_text("", encoding="utf-8")
-    reddit_log_path = LOG_DIR / "reddit_checks.txt"
+    log(f"[{label}] Testing {len(testable)} configs (workers={args.workers})...")
 
-    log(f"[Step 3] Enriching {len(configs)} configs (workers={TEST_WORKERS})...")
-    
-    # Direct runner control for Reddit
-    direct_reddit_status, direct_reddit_details = reddit_direct_control()
-    log(f"Direct runner Reddit control (NOT through Xray): {direct_reddit_status}")
-
-    enriched: list[tuple[str, dict]] = []
-    site_check_results = []
-    
-    counts = {
-        "GEMINI": 0, "NOGEMINI": 0,
-        "REDDIT": 0, "NOREDDIT": 0,
-    }
-    reddit_stats = {
-        "security_block": 0, "rate_limited": 0, "unclassified_403": 0,
-        "login_required": 0, "http_error": 0, "unreachable": 0, "other": 0,
-    }
-    
+    passed_pairs: list[tuple[str, dict]] = []
+    enriched_pairs: list[tuple[str, dict]] = []
+    diag_entries: list[tuple[str, EnrichResult]] = []
+    passed = failed = skipped_budget = dead = idx = 0
+    gtags: Counter = Counter()
     start = time.time()
 
-    def record(uri: str, p: dict, gemini_ok: bool, reddit_ok: bool, country: str | None) -> None:
-        new_remark = build_enriched_remark(gemini_ok, reddit_ok, country)
-        new_uri = set_remark(uri, new_remark, p["protocol"])
-        new_p = dict(p)
-        new_p["remark"] = new_remark
-        enriched.append((new_uri, new_p))
-        _append_line(out_path, new_uri)
-
-    with ThreadPoolExecutor(max_workers=TEST_WORKERS) as ex:
-        futures = {ex.submit(test_enrich, p): (uri, p) for uri, p in configs}
+    with ExitStack() as stack:
+        ww = stack.enter_context(LineWriter(ALIVE_DIR / "working.txt")) if do_endpoint else None
+        ew = stack.enter_context(LineWriter(ALIVE_DIR / "enriched.txt")) if do_enrich else None
+        ex = stack.enter_context(ThreadPoolExecutor(max_workers=args.workers))
+        futures = {ex.submit(test_worker, p, do_endpoint, do_enrich): (uri, p)
+                   for uri, p in testable}
         done = 0
-        for fut in as_completed(futures):
-            done += 1
-            uri, p = futures[fut]
-            try:
-                (gemini_ok, reddit_ok, country, gemini_status, reddit_status, 
-                 reddit_details, reddit_category) = fut.result()
-            except Exception as e:
-                _endline()
-                log(f"[Step 3]   ERR {uri[:70]}: {e}")
-                gemini_ok, reddit_ok, country = False, False, None
-                gemini_status = f"Test Exception: {e}"
-                reddit_status = f"Test Exception: {e}"
-                reddit_details = ""
-                reddit_category = "other"
-
-            record(uri, p, gemini_ok, reddit_ok, country)
-            site_check_results.append((uri, gemini_status, reddit_status, reddit_details))
-            
-            counts["GEMINI" if gemini_ok else "NOGEMINI"] += 1
-            counts["REDDIT" if reddit_ok else "NOREDDIT"] += 1
-            if not reddit_ok:
-                reddit_stats[reddit_category] = reddit_stats.get(reddit_category, 0) + 1
-
-            _render_bar(
-                "Step 3", done, len(configs), start,
-                f"Gem:{counts['GEMINI']} Red:{counts['REDDIT']}"
-            )
+        try:
+            for fut in as_completed(futures):
+                done += 1
+                uri, p = futures[fut]
+                try:
+                    outcome = fut.result()
+                except TaskSkipped:
+                    if skipped_budget == 0:
+                        _endline()
+                        log(f"[{label}] Stop/time-budget reached — skipping remaining configs.")
+                    skipped_budget += 1
+                except Exception as e:
+                    failed += 1
+                    _endline()
+                    log(f"[{label}]   ERR {uri[:70]}: {e}")
+                else:
+                    if do_endpoint:
+                        if outcome.alive:
+                            passed += 1
+                            passed_pairs.append((uri, p))
+                            ww.write(uri)
+                        else:
+                            failed += 1
+                    if (do_enrich and outcome.enrich is not None
+                            and (outcome.alive or not do_endpoint)):
+                        res = outcome.enrich
+                        idx += 1
+                        remark = build_enriched_remark(res, idx)
+                        new_uri = set_remark(uri, remark, p["protocol"])
+                        new_p = dict(p)
+                        new_p["remark"] = remark
+                        enriched_pairs.append((new_uri, new_p))
+                        ew.write(new_uri)
+                        diag_entries.append((uri, res))
+                        if res.dead:
+                            dead += 1
+                        else:
+                            gtags[gemini_tag(res.gemini)] += 1
+                extra_parts = []
+                if do_endpoint:
+                    extra_parts.append(f"PASS {passed} FAIL {failed}")
+                if do_enrich:
+                    extra_parts.append(f"Gem:{gtags['GEMINI']} Dead:{dead}")
+                if skipped_budget:
+                    extra_parts.append(f"SKIP {skipped_budget}")
+                _render_bar(label, done, len(testable), start, "  ".join(extra_parts))
+        except KeyboardInterrupt:
+            STOP.set()
+            _endline()
+            log(f"[{label}] Interrupted — cancelling queued tasks; "
+                "running ones finish within their timeouts.")
+            ex.shutdown(wait=False, cancel_futures=True)
     _endline()
 
     elapsed = time.time() - start
-    
-    # Save detailed Reddit diagnostics
-    with reddit_log_path.open("w", encoding="utf-8", newline="\n") as f:
-        f.write("DIRECT RUNNER CONTROL (not through Xray)\n")
-        f.write(f"Reddit: {direct_reddit_status}\n")
-        f.write(f"Details: {direct_reddit_details}\n")
-        f.write("=" * 80 + "\n")
-        for i, (uri, gemini_status, reddit_status, reddit_details) in enumerate(site_check_results, 1):
-            f.write(f"[{i}] URI: {uri}\n")
-            f.write(f"Gemini: {gemini_status}\n")
-            f.write(f"Reddit: {reddit_status}\n")
-            f.write(f"Reddit details: {reddit_details}\n")
-            f.write("-" * 80 + "\n")
-    log(f"[Step 3] Saved Reddit diagnostics: {reddit_log_path}")
-
-    log(
-        f"[Step 3] Done in {elapsed:.0f}s — "
-        f"GEMINI {counts['GEMINI']}  NOGEMINI {counts['NOGEMINI']}  |  "
-        f"REDDIT {counts['REDDIT']}  NOREDDIT {counts['NOREDDIT']}"
-    )
-    log(
-        f"[Step 3] Reddit Failures — "
-        f"Security Block: {reddit_stats['security_block']}  "
-        f"Rate Limited: {reddit_stats['rate_limited']}  "
-        f"Unclassified 403: {reddit_stats['unclassified_403']}  "
-        f"Login Req: {reddit_stats['login_required']}  "
-        f"HTTP Err: {reddit_stats['http_error']}  "
-        f"Unreachable: {reddit_stats['unreachable']}"
-    )
-    log(f"[Step 3] Saved: {out_path}  ({len(enriched)} configs)")
-    return enriched
+    if do_endpoint:
+        log(f"[{label}] Endpoint: PASS {passed}  FAIL {failed}  "
+            f"UNSUPPORTED {unsupported}  SKIPPED {skipped_budget}  ({elapsed:.0f}s)")
+        log(f"[{label}] Saved: {ALIVE_DIR / 'working.txt'}")
+        SUMMARY["endpoint"] = {"pass": passed, "fail": failed,
+                               "unsupported": unsupported, "skipped": skipped_budget}
+    if do_enrich:
+        diag_path = LOG_DIR / "enrich_checks.txt"
+        _write_enrich_diagnostics(diag_path, diag_entries)
+        log(f"[{label}] Gemini: GEMINI {gtags['GEMINI']}  NOGEMINI {gtags['NOGEMINI']}  "
+            f"GEMERR {gtags['GEMERR']}  |  DEAD {dead}  ({elapsed:.0f}s)")
+        log(f"[{label}] Saved: {ALIVE_DIR / 'enriched.txt'}  ({len(enriched_pairs)} configs)")
+        log(f"[{label}] Diagnostics: {diag_path}")
+        SUMMARY["enrich"] = {
+            "gemini": {k: gtags[k] for k in ("GEMINI", "NOGEMINI", "GEMERR")},
+            "dead": dead, "skipped": skipped_budget,
+        }
+    return enriched_pairs if do_enrich else passed_pairs
 
 
 # ---------------------------------------------------------------- pipeline
-def run_pipeline(steps: set[int], custom_file_arg: str | None) -> None:
-    ensure_dirs()
-
-    if not steps:
-        log("No steps selected — nothing to do.")
-        return
-    if steps & {STEP_ENDPOINT, STEP_ENRICH} and STEP_SOURCE not in steps:
-        log("ERROR: a source step (1) is required when running tests.")
-        return
-        
-    if not socks_support_available():
-        log("ERROR: SOCKS proxy support is missing.")
-        log("       Install it with: python -m pip install 'requests[socks]'")
-        return
-
-    # ---- Step 1: resolve source ----
-    current: list[tuple[str, dict]] = []
-    if STEP_SOURCE in steps:
-        if custom_file_arg:
-            path = Path(custom_file_arg)
-            if not path.exists():
-                path = SCRIPT_DIR / custom_file_arg
-            if not path.exists():
-                log(f"ERROR: custom file not found: {custom_file_arg}")
-                return
-            loaded = run_source_custom(path)
-        elif IS_TTY:
-            choice = prompt_source()
-            if choice is None:
-                log("Source cancelled — aborting.")
-                return
-            kind, path = choice
-            loaded = run_source_fetch() if kind == "fetch" else run_source_custom(path)  # type: ignore[arg-type]
-        else:
-            loaded = run_source_fetch()
-        if loaded is None:
-            return
-        current = loaded
-
-    if not current:
-        log("No configs available — aborting.")
-        return
-
-    # ---- Step 2: endpoint test ----
-    if STEP_ENDPOINT in steps:
-        result = run_endpoint_test(current)
-        if result is None:
-            return
-        current = result
-
-    # ---- Step 3: enrich ----
-    if STEP_ENRICH in steps:
-        result = run_enrich(current)
-        if result is None:
-            return
-        current = result
-
-    log(f"Pipeline complete. Final configs: {len(current)}")
-
-
-# ---------------------------------------------------------------- main
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Proxy config pipeline: source → endpoint test → enrich."
-    )
-    parser.add_argument(
-        "--steps", default=None,
-        help="Non-interactive step combo (e.g. '1+2+3'). "
-             "If omitted and stdin is a TTY, you'll be prompted.",
-    )
-    parser.add_argument(
-        "--custom-file", default=None,
-        help="With --steps containing '1', load this file instead of fetching.",
-    )
-    args = parser.parse_args()
-
-    if args.steps:
+def resolve_steps(args: argparse.Namespace) -> set[int] | None:
+    raw = args.steps or os.environ.get("PROXY_STEPS")
+    if raw:
         try:
-            steps = _parse_steps(args.steps)
+            steps = _parse_steps(raw)
         except ValueError as e:
             log(f"ERROR: {e}")
-            return
-        if steps & {STEP_ENDPOINT, STEP_ENRICH} and STEP_SOURCE not in steps:
-            log("ERROR: a source step (1) is required when running tests.")
-            return
-    elif IS_TTY:
+            return None
+    elif IS_TTY and not IN_CI:
         steps = prompt_steps()
         if steps is None:
             log("No steps given — exiting.")
-            return
+            return None
+    elif IN_CI:
+        steps = {STEP_SOURCE, STEP_ENDPOINT, STEP_ENRICH}
+        log("CI detected, no --steps given — defaulting to 1+2+3.")
     else:
         log("Non-interactive and no --steps given.")
-        log("Example:  python script.py --steps '1+2+3'")
-        return
+        log("Example:  python proxy_pipeline.py --steps '1+2+3'")
+        return None
+    if steps & {STEP_ENDPOINT, STEP_ENRICH} and STEP_SOURCE not in steps:
+        log("ERROR: a source step (1) is required when running tests.")
+        return None
+    return steps
 
+
+def run_pipeline(args: argparse.Namespace, steps: set[int]) -> int:
+    global FETCH_PROXIES, ALLOW_INSECURE, DEADLINE
+    ensure_dirs()
+    pipeline_start = time.time()
+    SUMMARY["steps"] = sorted(steps)
+
+    fetch_proxy = args.fetch_proxy or os.environ.get("FETCH_PROXY") or ""
+    if fetch_proxy:
+        FETCH_PROXIES = {"http": fetch_proxy, "https": fetch_proxy}
+        log(f"Fetch proxy: {fetch_proxy}")
+    ALLOW_INSECURE = args.allow_insecure
+    if args.time_budget and args.time_budget > 0:
+        DEADLINE = time.monotonic() + args.time_budget * 60
+        log(f"Time budget: {args.time_budget:g} minutes")
+
+    # ---- Step 1: source ----
+    if args.custom_file:
+        path = Path(args.custom_file)
+        if not path.exists():
+            path = SCRIPT_DIR / args.custom_file
+        if not path.exists():
+            log(f"ERROR: custom file not found: {args.custom_file}")
+            return 1
+        loaded = run_source_custom(path)
+    elif IS_TTY and not IN_CI and not args.steps:
+        choice = prompt_source()
+        if choice is None:
+            log("Source cancelled — aborting.")
+            return 1
+        kind, path = choice
+        loaded = run_source_fetch() if kind == "fetch" else run_source_custom(path)
+    else:
+        loaded = run_source_fetch()
+    if loaded is None:
+        return 1
+    if not loaded:
+        log("No configs available — aborting (previous outputs left untouched).")
+        return 1
+    current = loaded
+
+    # ---- Steps 2/3 ----
+    if steps & {STEP_ENDPOINT, STEP_ENRICH}:
+        if not socks_support_available():
+            log("ERROR: SOCKS proxy support is missing.")
+            log("       Install it with: python -m pip install 'requests[socks]'")
+            return 1
+        if not ensure_xray_ready(auto_install=not args.no_install_xray):
+            return 1
+        result = run_tests(current, STEP_ENDPOINT in steps, STEP_ENRICH in steps, args)
+        if result is None:
+            return 1
+        current = result
+
+    write_summary_files(time.time() - pipeline_start)
+    log(f"Pipeline complete. Final configs: {len(current)}")
+    return 130 if STOP.is_set() else 0
+
+
+# ---------------------------------------------------------------- main
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Proxy config pipeline: source -> endpoint test -> enrich (CI-friendly)."
+    )
+    parser.add_argument("--steps", default=None,
+                        help="Step combo, e.g. '1+2+3'. CI default: 1+2+3. Env: PROXY_STEPS.")
+    parser.add_argument("--custom-file", default=None,
+                        help="Load this file as the source instead of fetching sub_links.txt.")
+    parser.add_argument("--workers", type=int, default=TEST_WORKERS,
+                        help=f"Concurrent test workers for steps 2/3 (default {TEST_WORKERS}).")
+    parser.add_argument("--time-budget", type=float, default=0,
+                        help="Minutes; stop testing gracefully after this (0 = unlimited). "
+                             "Set below the job's timeout-minutes so results still get saved.")
+    parser.add_argument("--fetch-proxy", default=None,
+                        help="Proxy for fetching subscriptions/installing xray, "
+                             "e.g. socks5h://127.0.0.1:1080. Env: FETCH_PROXY.")
+    parser.add_argument("--allow-insecure", action="store_true",
+                        help="Honor allowInsecure=1 links (self-signed certs). "
+                             "Off by default; enables MITM-able tests for those nodes.")
+    parser.add_argument("--no-install-xray", action="store_true",
+                        help="Do not auto-download xray when it is missing.")
+    return parser
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
+    steps = resolve_steps(args)
+    if steps is None:
+        return 1
     log(f"Selected steps: {sorted(steps)}")
     try:
-        run_pipeline(steps, args.custom_file)
+        return run_pipeline(args, steps)
     except KeyboardInterrupt:
+        STOP.set()
         log("Stopped by user.")
+        return 130
     except Exception as e:
         ensure_dirs()
-        log_file = LOG_DIR / "failed.txt"
-        log_file.write_text(f"Fatal error: {e}\n", encoding="utf-8")
+        fatal_log = LOG_DIR / "fatal.txt"          # separate from fetch failed.txt
+        fatal_log.write_text(traceback.format_exc(), encoding="utf-8")
         log(f"Fatal error: {e}")
-        log(f"Logged to: {log_file}")
+        log(f"Traceback logged to: {fatal_log}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
