@@ -94,7 +94,7 @@ TEST_ENDPOINTS = [
 ]
 TEST_TIMEOUT = (3, 5)            # connect, read — through a proxy chain
 ENDPOINT_ROUNDS = 2              # one full retry round
-TEST_WORKERS = 20                # concurrent test workers (steps 2 and 3)
+TEST_WORKERS = 40                # concurrent test workers (steps 2 and 3)
 
 # ---- Gemini check ----
 GEMINI_TEST_URL = "https://gemini.google.com/?hl=en"
