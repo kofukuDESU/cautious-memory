@@ -5,16 +5,13 @@ Proxy config pipeline.
 Steps:
   1 = Fetch / custom file (source)
   2 = Endpoint Test
-  3 = Enrich (Gemini + geo + residency, no filtering)
+  3 = Enrich (Gemini + Geo + Reddit, no filtering)
 
-All output goes to ./ALIVE/ as plain text:
-
+Outputs (Plain text in ./ALIVE/):
   ALIVE/all.txt       → deduplicated source configs
   ALIVE/working.txt   → configs that passed the endpoint test
-  ALIVE/enriched.txt  → every input config annotated with
-                        {flag}-{CC}-{GEMINI|NOGEMINI}-{RESIDENTIAL|HOSTING|VPN}
-
-Original remarks are not preserved in the enriched output.
+  ALIVE/enriched.txt  → every working config annotated with
+                        {flag}-{CC}-{GEMINI|NOGEMINI}-{REDDIT|NOREDDIT}
 """
 
 import argparse
@@ -26,15 +23,16 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
-from proxy_ip_check import is_residential  # noqa: F401  (unused here, kept for parity)
 
 # ---------------------------------------------------------------- config
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -57,14 +55,44 @@ TEST_ENDPOINTS = [
 TEST_TIMEOUT = 1
 TEST_WORKERS = 50
 
+# ---- Gemini check ----
 GEMINI_TEST_URL = "https://gemini.google.com/"
 GEMINI_TIMEOUT = 5
 GEMINI_BLOCKED_MARKER = "Gemini isn't currently supported in your country. Stay tuned!"
 
-# status, countryCode, hosting, proxy, isp, org
-GEO_ENRICH_URL = (
-    "http://ip-api.com/line/?fields=status,countryCode,hosting,proxy,isp,org"
+# ---- Reddit check ----
+REDDIT_TEST_URL = "https://www.reddit.com/"
+REDDIT_TIMEOUT = (5, 8)
+REDDIT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+REDDIT_MAX_CONCURRENT = 3
+REDDIT_MIN_INTERVAL_SECONDS = 0.5
+REDDIT_BODY_PREVIEW_CHARS = 350
+REDDIT_BLOCKED_MARKERS = (
+    "you've been blocked by network security",
+    "you have been blocked by network security",
+    "blocked by network security",
+    "if you think you've been blocked by mistake",
 )
+
+# ---- Geo check ----
+GEO_ENRICH_URL = "http://ip-api.com/line/?fields=status,countryCode"
 GEO_TIMEOUT = 5
 
 CONFIG_RE = re.compile(
@@ -78,13 +106,10 @@ STEP_ENRICH   = 3
 
 IS_TTY = sys.stdout.isatty()
 
-# Known VPN / proxy AS names to catch cases ip-api.com's `proxy` flag misses
-VPN_KEYWORDS = re.compile(
-    r"\b(?:nordvpn|expressvpn|surfshark|protonvpn|windscribe|mullvad|cyberghost|"
-    r"purevpn|torguard|ipvanish|private internet access|hotspot shield|"
-    r"tunnelbear|zenmate|ivacy|hidemyass|pia)\b",
-    re.IGNORECASE,
-)
+# Reddit rate-limiting primitives
+_REDDIT_SEMAPHORE = threading.BoundedSemaphore(REDDIT_MAX_CONCURRENT)
+_REDDIT_RATE_LOCK = threading.Lock()
+_REDDIT_LAST_REQUEST_START = 0.0
 
 
 # ---------------------------------------------------------------- helpers
@@ -189,13 +214,15 @@ def set_remark(uri: str, new_remark: str, protocol: str) -> str:
     return f"{base}#{quote(new_remark, safe='')}"
 
 
-def build_enriched_remark(gemini_ok: bool, country: str | None, residency: str) -> str:
+def build_enriched_remark(gemini_ok: bool, reddit_ok: bool, country: str | None) -> str:
     """Compose the final remark from the three test results, discarding the original."""
     parts: list[str] = []
     if country:
         parts.append(f"{country_flag(country)}-{country}")
+    
     parts.append("GEMINI" if gemini_ok else "NOGEMINI")
-    parts.append(residency)
+    parts.append("REDDIT" if reddit_ok else "NOREDDIT")
+    
     return "-".join(parts)
 
 
@@ -491,6 +518,14 @@ def xray_available() -> bool:
         return False
 
 
+def socks_support_available() -> bool:
+    try:
+        import socks  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 # ---------------------------------------------------------------- tests
 def test_endpoints(p: dict) -> bool:
     with xray_proxy(p) as proxies:
@@ -517,55 +552,175 @@ def is_gemini_blocked(body: str) -> bool:
     return _normalize_for_match(GEMINI_BLOCKED_MARKER) in _normalize_for_match(body)
 
 
-def classify_residency(hosting: bool, is_proxy: bool, isp: str, org: str) -> str:
-    if is_proxy:
-        return "VPN"
-    if VPN_KEYWORDS.search(isp or "") or VPN_KEYWORDS.search(org or ""):
-        return "VPN"
-    if hosting:
-        return "HOSTING"
-    return "RESIDENTIAL"
+# --- Reddit Specific Helpers ---
+def find_reddit_block_marker(body: str) -> str | None:
+    normalized = _normalize_for_match(unescape(body or ""))
+    for marker in REDDIT_BLOCKED_MARKERS:
+        normalized_marker = _normalize_for_match(marker)
+        if normalized_marker in normalized:
+            return marker
+    return None
 
 
-def test_enrich(p: dict) -> tuple[bool, str | None, str]:
-    """Gemini + geo + residency check within a single xray session.
+def _reddit_rate_limit() -> None:
+    global _REDDIT_LAST_REQUEST_START
+    with _REDDIT_RATE_LOCK:
+        now = time.monotonic()
+        delay = REDDIT_MIN_INTERVAL_SECONDS - (now - _REDDIT_LAST_REQUEST_START)
+        if delay > 0:
+            time.sleep(delay)
+        _REDDIT_LAST_REQUEST_START = time.monotonic()
 
-    Returns (gemini_ok, country_code_or_None, residency_class).
+
+def _response_excerpt(body: str, marker: str | None = None) -> str:
+    text = re.sub(r"\s+", " ", unescape(body or "")).strip()
+    if not text:
+        return "<empty response body>"
+    if marker:
+        lower_text = _normalize_for_match(text)
+        lower_marker = _normalize_for_match(marker)
+        pos = lower_text.find(lower_marker)
+        if pos >= 0:
+            start = max(0, pos - 100)
+            end = min(len(text), pos + len(marker) + 180)
+            return text[start:end][:REDDIT_BODY_PREVIEW_CHARS]
+    return text[:REDDIT_BODY_PREVIEW_CHARS]
+
+
+def classify_reddit_response(response: requests.Response) -> tuple[bool, str, str, str]:
+    body = response.text or ""
+    marker = find_reddit_block_marker(body)
+    status_code = response.status_code
+    content_type = response.headers.get("Content-Type", "unknown")
+    final_url = response.url
+    elapsed = getattr(getattr(response, "elapsed", None), "total_seconds", lambda: 0.0)()
+    body_bytes = len(response.content or b"")
+
+    history = getattr(response, "history", []) or []
+    redirect_chain = " -> ".join([item.url for item in history] + [final_url])
+    detail_parts = [
+        f"HTTP {status_code}", f"redirect_chain={redirect_chain}",
+        f"final_url={final_url}", f"content_type={content_type}",
+        f"elapsed={elapsed:.2f}s", f"body_bytes={body_bytes}",
+    ]
+    for header in ("Server", "Retry-After", "X-Ratelimit-Used", "X-Ratelimit-Remaining", "X-Ratelimit-Reset", "X-Reddit-Request-Id"):
+        value = response.headers.get(header)
+        if value:
+            detail_parts.append(f"{header}={value}")
+    if marker:
+        detail_parts.append(f"matched_marker={marker!r}")
+    detail_parts.append(f"body_excerpt={_response_excerpt(body, marker)!r}")
+    details = " | ".join(detail_parts)
+
+    if marker:
+        return False, f"Confirmed network-security block (HTTP {status_code})", details, "security_block"
+    if status_code == 429:
+        return False, "Rate limited (HTTP 429)", details, "rate_limited"
+    if status_code == 403:
+        return False, "HTTP 403 (no recognized security marker)", details, "unclassified_403"
+    if status_code == 401:
+        return False, "Authentication required (HTTP 401)", details, "login_required"
+    if status_code >= 500:
+        return False, f"Reddit server error (HTTP {status_code})", details, "http_error"
+    if status_code >= 400:
+        return False, f"HTTP error {status_code}", details, "http_error"
+    if 200 <= status_code < 300:
+        if not body.strip():
+            return False, f"Empty response body (HTTP {status_code})", details, "other"
+        final_path = urlparse(final_url).path.lower().rstrip("/")
+        if final_path.startswith(("/login", "/account/login", "/register")):
+            return False, f"Login page returned (HTTP {status_code})", details, "login_required"
+        normalized_content_type = content_type.lower()
+        if normalized_content_type != "unknown" and not any(
+            kind in normalized_content_type for kind in ("text/html", "application/xhtml+xml")
+        ):
+            return False, f"Unexpected content type ({content_type})", details, "other"
+        return True, f"Allowed (HTTP {status_code})", details, "allowed"
+    if 300 <= status_code < 400:
+        return False, f"Unresolved redirect (HTTP {status_code})", details, "other"
+    return False, f"Unexpected HTTP status {status_code}", details, "other"
+
+
+def reddit_request(proxies: dict | None = None) -> tuple[bool, str, str, str]:
+    with _REDDIT_SEMAPHORE:
+        _reddit_rate_limit()
+        response = requests.get(
+            REDDIT_TEST_URL,
+            headers=REDDIT_HEADERS,
+            proxies=proxies,
+            timeout=REDDIT_TIMEOUT,
+            allow_redirects=True,
+        )
+    return classify_reddit_response(response)
+
+
+def reddit_direct_control() -> tuple[str, str]:
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.get(
+                REDDIT_TEST_URL, headers=REDDIT_HEADERS,
+                timeout=REDDIT_TIMEOUT, allow_redirects=True,
+            )
+        _, status, details, _ = classify_reddit_response(response)
+        return status, details
+    except requests.RequestException as exc:
+        return f"Unreachable: {type(exc).__name__}: {exc}", f"direct_runner_exception={exc!r}"
+
+
+# ---------------------------------------------------------------- enrich test
+def test_enrich(p: dict) -> tuple[bool, bool, str | None, str, str, str, str]:
+    """Combined Gemini + Reddit + Geo check within a single xray session.
+    
+    Returns (gemini_ok, reddit_ok, country, gemini_status, reddit_status, reddit_details, reddit_category).
     """
     with xray_proxy(p) as proxies:
         if proxies is None:
-            return (False, None, "UNKNOWN")
+            return (False, False, None, "Proxy failed", "Proxy failed", "", "unreachable")
 
-        # --- Gemini ---
+        # --- 1. Gemini ---
         gemini_ok = False
+        gemini_status = "Unknown error"
         try:
             g = requests.get(
                 GEMINI_TEST_URL, proxies=proxies,
                 timeout=GEMINI_TIMEOUT, allow_redirects=True,
             )
-            if g.status_code < 400:
-                gemini_ok = not is_gemini_blocked(g.text or "")
-        except requests.RequestException:
-            pass
+            if g.status_code >= 400:
+                gemini_status = f"HTTP {g.status_code}"
+            elif is_gemini_blocked(g.text or ""):
+                gemini_status = "Geo-blocked"
+            else:
+                gemini_ok = True
+                gemini_status = "Allowed"
+        except requests.RequestException as e:
+            gemini_status = f"Unreachable: {e}"
 
-        # --- Geo + Residency ---
-        country: str | None = None
-        residency = "UNKNOWN"
+        # --- 2. Reddit ---
+        reddit_ok = False
+        reddit_details = ""
+        reddit_category = "other"
+        try:
+            reddit_ok, reddit_status, reddit_details, reddit_category = reddit_request(proxies)
+        except requests.RequestException as e:
+            reddit_status = f"Unreachable: {type(e).__name__}: {e}"
+            reddit_details = f"request_exception={e!r}"
+            reddit_category = "unreachable"
+
+        # --- 3. Geo ---
+        country = None
         try:
             r = requests.get(GEO_ENRICH_URL, proxies=proxies, timeout=GEO_TIMEOUT)
             if r.status_code == 200:
                 lines = [ln.strip() for ln in r.text.strip().splitlines()]
-                if len(lines) >= 6 and lines[0].lower() == "success":
+                if len(lines) >= 2 and lines[0].lower() == "success":
                     cc = lines[1].upper()
                     if len(cc) == 2 and cc.isalpha():
                         country = cc
-                    hosting = lines[2].lower() == "true"
-                    is_proxy = lines[3].lower() == "true"
-                    residency = classify_residency(hosting, is_proxy, lines[4], lines[5])
         except requests.RequestException:
             pass
 
-        return (gemini_ok, country, residency)
+        return (gemini_ok, reddit_ok, country, gemini_status, reddit_status, reddit_details, reddit_category)
 
 
 # ---------------------------------------------------------------- progress
@@ -609,7 +764,7 @@ def prompt_steps() -> set[int] | None:
     print("Select steps (combine with '+'):")
     print("  1 = Fetch / custom file (source)")
     print("  2 = Endpoint Test")
-    print("  3 = Enrich (Gemini + geo + residency)")
+    print("  3 = Enrich (Gemini + Geo + Reddit)")
     print()
     print("Examples: 1  |  1+2  |  1+2+3")
     while True:
@@ -647,7 +802,6 @@ def _parse_steps(s: str) -> set[int]:
 
 
 def prompt_source() -> tuple[str, Path | None] | None:
-    """Return ('fetch', None) or ('custom', path) or None to abort."""
     print()
     print("Source:")
     print("  [1] Fetch subscription URLs (sub_links.txt)  (default)")
@@ -793,14 +947,8 @@ def run_endpoint_test(configs: list[tuple[str, dict]]) -> list[tuple[str, dict]]
 
 
 def run_enrich(configs: list[tuple[str, dict]]) -> list[tuple[str, dict]] | None:
-    """Step 3 — annotate every config with geo + Gemini + residency.
-
-    Every input config appears in the output with the result of all three
-    tests encoded in its remark. Original remarks are discarded. Format:
-
-        {flag}-{CC}-{GEMINI|NOGEMINI}-{RESIDENTIAL|HOSTING|VPN}
-    """
-    log("[Step 3] Enrich (geo + Gemini + residency)")
+    """Step 3 — annotate every config with geo + Gemini + Reddit."""
+    log("[Step 3] Enrich (geo + Gemini + Reddit)")
     if not configs:
         log("[Step 3] No configs to enrich.")
         return []
@@ -810,18 +958,30 @@ def run_enrich(configs: list[tuple[str, dict]]) -> list[tuple[str, dict]] | None
 
     out_path = ALIVE_DIR / "enriched.txt"
     out_path.write_text("", encoding="utf-8")
+    reddit_log_path = LOG_DIR / "reddit_checks.txt"
 
     log(f"[Step 3] Enriching {len(configs)} configs (workers={TEST_WORKERS})...")
+    
+    # Direct runner control for Reddit
+    direct_reddit_status, direct_reddit_details = reddit_direct_control()
+    log(f"Direct runner Reddit control (NOT through Xray): {direct_reddit_status}")
+
     enriched: list[tuple[str, dict]] = []
+    site_check_results = []
+    
     counts = {
         "GEMINI": 0, "NOGEMINI": 0,
-        "RESIDENTIAL": 0, "HOSTING": 0, "VPN": 0, "UNKNOWN": 0,
+        "REDDIT": 0, "NOREDDIT": 0,
     }
+    reddit_stats = {
+        "security_block": 0, "rate_limited": 0, "unclassified_403": 0,
+        "login_required": 0, "http_error": 0, "unreachable": 0, "other": 0,
+    }
+    
     start = time.time()
 
-    def record(uri: str, p: dict, gemini_ok: bool,
-               country: str | None, residency: str) -> None:
-        new_remark = build_enriched_remark(gemini_ok, country, residency)
+    def record(uri: str, p: dict, gemini_ok: bool, reddit_ok: bool, country: str | None) -> None:
+        new_remark = build_enriched_remark(gemini_ok, reddit_ok, country)
         new_uri = set_remark(uri, new_remark, p["protocol"])
         new_p = dict(p)
         new_p["remark"] = new_remark
@@ -835,30 +995,60 @@ def run_enrich(configs: list[tuple[str, dict]]) -> list[tuple[str, dict]] | None
             done += 1
             uri, p = futures[fut]
             try:
-                gemini_ok, country, residency = fut.result()
+                (gemini_ok, reddit_ok, country, gemini_status, reddit_status, 
+                 reddit_details, reddit_category) = fut.result()
             except Exception as e:
                 _endline()
                 log(f"[Step 3]   ERR {uri[:70]}: {e}")
-                gemini_ok, country, residency = False, None, "UNKNOWN"
+                gemini_ok, reddit_ok, country = False, False, None
+                gemini_status = f"Test Exception: {e}"
+                reddit_status = f"Test Exception: {e}"
+                reddit_details = ""
+                reddit_category = "other"
 
-            record(uri, p, gemini_ok, country, residency)
+            record(uri, p, gemini_ok, reddit_ok, country)
+            site_check_results.append((uri, gemini_status, reddit_status, reddit_details))
+            
             counts["GEMINI" if gemini_ok else "NOGEMINI"] += 1
-            counts[residency] = counts.get(residency, 0) + 1
+            counts["REDDIT" if reddit_ok else "NOREDDIT"] += 1
+            if not reddit_ok:
+                reddit_stats[reddit_category] = reddit_stats.get(reddit_category, 0) + 1
 
             _render_bar(
                 "Step 3", done, len(configs), start,
-                f"G:{counts['GEMINI']}  "
-                f"R:{counts['RESIDENTIAL']} H:{counts['HOSTING']} "
-                f"V:{counts['VPN']} U:{counts['UNKNOWN']}"
+                f"Gem:{counts['GEMINI']} Red:{counts['REDDIT']}"
             )
     _endline()
 
     elapsed = time.time() - start
+    
+    # Save detailed Reddit diagnostics
+    with reddit_log_path.open("w", encoding="utf-8", newline="\n") as f:
+        f.write("DIRECT RUNNER CONTROL (not through Xray)\n")
+        f.write(f"Reddit: {direct_reddit_status}\n")
+        f.write(f"Details: {direct_reddit_details}\n")
+        f.write("=" * 80 + "\n")
+        for i, (uri, gemini_status, reddit_status, reddit_details) in enumerate(site_check_results, 1):
+            f.write(f"[{i}] URI: {uri}\n")
+            f.write(f"Gemini: {gemini_status}\n")
+            f.write(f"Reddit: {reddit_status}\n")
+            f.write(f"Reddit details: {reddit_details}\n")
+            f.write("-" * 80 + "\n")
+    log(f"[Step 3] Saved Reddit diagnostics: {reddit_log_path}")
+
     log(
         f"[Step 3] Done in {elapsed:.0f}s — "
         f"GEMINI {counts['GEMINI']}  NOGEMINI {counts['NOGEMINI']}  |  "
-        f"RESIDENTIAL {counts['RESIDENTIAL']}  HOSTING {counts['HOSTING']}  "
-        f"VPN {counts['VPN']}  UNKNOWN {counts['UNKNOWN']}"
+        f"REDDIT {counts['REDDIT']}  NOREDDIT {counts['NOREDDIT']}"
+    )
+    log(
+        f"[Step 3] Reddit Failures — "
+        f"Security Block: {reddit_stats['security_block']}  "
+        f"Rate Limited: {reddit_stats['rate_limited']}  "
+        f"Unclassified 403: {reddit_stats['unclassified_403']}  "
+        f"Login Req: {reddit_stats['login_required']}  "
+        f"HTTP Err: {reddit_stats['http_error']}  "
+        f"Unreachable: {reddit_stats['unreachable']}"
     )
     log(f"[Step 3] Saved: {out_path}  ({len(enriched)} configs)")
     return enriched
@@ -873,6 +1063,11 @@ def run_pipeline(steps: set[int], custom_file_arg: str | None) -> None:
         return
     if steps & {STEP_ENDPOINT, STEP_ENRICH} and STEP_SOURCE not in steps:
         log("ERROR: a source step (1) is required when running tests.")
+        return
+        
+    if not socks_support_available():
+        log("ERROR: SOCKS proxy support is missing.")
+        log("       Install it with: python -m pip install 'requests[socks]'")
         return
 
     # ---- Step 1: resolve source ----
