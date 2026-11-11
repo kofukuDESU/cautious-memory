@@ -27,7 +27,7 @@ concurrency:
 jobs:
   run:
     if: false # Temporary lock breaker
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     env:
       SAVE_ERROR_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.save_error_logs || 'false' }}
