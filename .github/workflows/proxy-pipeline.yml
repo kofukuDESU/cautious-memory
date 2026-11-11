@@ -2,7 +2,7 @@ name: proxy-pipeline
 
 on:
   schedule:
-    - cron: "0 */6 * * *"        # every 6 hours (UTC)
+    - cron: "22 4 * * *"      
   workflow_dispatch:
     inputs:
       steps:
