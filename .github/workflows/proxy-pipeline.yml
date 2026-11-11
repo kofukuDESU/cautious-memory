@@ -32,7 +32,7 @@ jobs:
 
       - name: Run pipeline
         run: |
-          python python.py \
+          python proxy-pipeline.py \
             --steps "${{ github.event.inputs.steps || '1+2+3' }}" \
             --time-budget 75
 
