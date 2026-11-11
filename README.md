@@ -5,8 +5,6 @@ tests every node through a real **Xray-core** session, and annotates the survivo
 with exit country and Gemini availability. Built to run unattended on **GitHub
 Actions** and commit fresh lists back to the repo.
 
-![pipeline](https://github.com/<USERNAME>/<REPO>/actions/workflows/proxy.yml/badge.svg)
-
 ---
 
 ## How it works
