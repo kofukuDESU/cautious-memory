@@ -26,10 +26,8 @@ concurrency:
 
 jobs:
   run:
-    # 22.04 is stable and matches the referenced workflow. ubuntu-latest
-    # is currently 26.04, which is very new — pin to a known-good image.
+    if: false # Temporary lock breaker
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
 
     env:
       SAVE_ERROR_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.save_error_logs || 'false' }}
