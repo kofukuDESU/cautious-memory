@@ -1,216 +1,54 @@
-name: Proxy pipeline
+name: proxy-pipeline
 
 on:
   schedule:
-    - cron: '0 0 * * *'          # every 24 hours at 00:00 UTC
+    - cron: "0 */6 * * *"        # every 6 hours (UTC)
   workflow_dispatch:
     inputs:
-      save_error_logs:
-        description: 'Commit logs/failed.txt to the repo'
-        required: true
-        type: boolean
-        default: false
-  push:
-    branches: [main]
-    paths:
-      - 'sub_links.txt'
-      - 'deepseek_python_simpled.py'
-      - '.github/workflows/proxy-pipeline.yml'
+      steps:
+        description: "Steps (1 / 1+2 / 1+2+3)"
+        default: "1+2+3"
 
 permissions:
   contents: write
 
 concurrency:
-  group: proxy-pipeline-v2
-  cancel-in-progress: true
+  group: proxy-pipeline
+  cancel-in-progress: false
 
 jobs:
   run:
-    runs-on: ubuntu-22.04
-
-    env:
-      SAVE_ERROR_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.save_error_logs || 'false' }}
-
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ubuntu-22.04 ships Python 3.10. Skip actions/setup-python to avoid
-      # the GitHub Releases asset endpoint that occasionally 504s.
-      - name: Verify runner Python
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          PYTHON_BIN="$(command -v python3)"
-          "$PYTHON_BIN" - <<'PY'
-          import sys
-          if sys.version_info[:2] != (3, 10):
-              raise SystemExit(f"Expected Python 3.10, found {sys.version.split()[0]}")
-          print(f"Using runner Python {sys.version.split()[0]}")
-          PY
-          echo "PYTHON_BIN=$PYTHON_BIN" >> "$GITHUB_ENV"
-
-      # THE CRITICAL STEP. requests[socks] pulls in PySocks, which is
-      # required for socks5h:// proxies. Without it every test fails
-      # with InvalidSchema.
-      - name: Install Python dependencies
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          "$PYTHON_BIN" -m pip install --user --disable-pip-version-check --no-input \
-            --upgrade pip
-          "$PYTHON_BIN" -m pip install --user --disable-pip-version-check --no-input \
-            'requests[socks]' proxy-ip-check
-
-      # Fail fast if PySocks didn't actually land on the same interpreter.
-      - name: Verify SOCKS support
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          "$PYTHON_BIN" - <<'PY'
-          import requests, socks
-          print("requests", requests.__version__)
-          print("PySocks  ", getattr(socks, "__version__", "installed"))
-
-          # Exercise a socks5h proxy scheme against an unreachable host to
-          # confirm requests accepts the scheme (not the connection).
-          import requests.exceptions
-          try:
-              requests.get(
-                  "http://127.0.0.1:1",
-                  proxies={"http": "socks5h://127.0.0.1:1"},
-                  timeout=0.1,
-              )
-          except requests.exceptions.InvalidSchema as e:
-              raise SystemExit(f"SOCKS scheme rejected: {e}")
-          except Exception:
-              # Any other exception (ProxyError, ConnectionError, Timeout)
-              # means the scheme was accepted — exactly what we want.
-              print("SOCKS scheme accepted by requests")
-          PY
-
-      # Xray via GHCR avoids the GitHub Releases asset endpoint that
-      # returned 504 in the referenced workflow.
-      - name: Install Xray Core
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          image="ghcr.io/xtls/xray-core:latest"
-          work_dir="$(mktemp -d)"
-          container_id=""
-          cleanup() {
-            [[ -n "$container_id" ]] && docker rm -f "$container_id" >/dev/null 2>&1 || true
-            rm -rf "$work_dir"
-          }
-          trap cleanup EXIT
-
-          pulled=false
-          for attempt in 1 2 3 4 5; do
-            if docker pull --platform linux/amd64 "$image"; then
-              pulled=true; break
-            fi
-            if (( attempt < 5 )); then
-              delay=$((attempt * 10))
-              echo "GHCR pull failed (${attempt}/5); retry in ${delay}s..."
-              sleep "$delay"
-            fi
-          done
-          [[ "$pulled" == true ]] || { echo "ERROR: could not pull $image"; exit 1; }
-
-          container_id="$(docker create --platform linux/amd64 "$image")"
-          docker cp "${container_id}:/usr/local/bin/xray" "$work_dir/xray"
-          docker rm "$container_id" >/dev/null
-          container_id=""
-
-          chmod 0755 "$work_dir/xray"
-          "$work_dir/xray" version | tee /tmp/xray-version.txt
-          grep --extended-regexp --quiet '^Xray [0-9]' /tmp/xray-version.txt
-
-          sudo install -m 0755 "$work_dir/xray" /usr/local/bin/xray
-          xray version
-
-      # One end-to-end sanity check before the full pipeline runs.
-      # Uses the freedom outbound so it doesn't depend on any subscription.
-      - name: Smoke test
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cat > /tmp/smoke.json <<'JSON'
-          {
-            "log": {"loglevel": "warning"},
-            "inbounds": [{
-              "port": 10808, "listen": "127.0.0.1",
-              "protocol": "socks", "settings": {"udp": false}
-            }],
-            "outbounds": [{"protocol": "freedom"}]
-          }
-          JSON
-
-          xray run -c /tmp/smoke.json & XRAY_PID=$!
-          trap 'kill $XRAY_PID 2>/dev/null || true' EXIT
-          sleep 1
-
-          "$PYTHON_BIN" - <<'PY'
-          import requests
-          proxies = {"http": "socks5h://127.0.0.1:10808",
-                     "https": "socks5h://127.0.0.1:10808"}
-          r = requests.get("https://cp.cloudflare.com",
-                           proxies=proxies, timeout=10)
-          print("Smoke test status:", r.status_code)
-          assert r.status_code < 500, f"unexpected status {r.status_code}"
-          PY
-
-      - name: Raise fd limit
-        shell: bash
-        run: |
-          echo "fd limit before: $(ulimit -n)"
-          ulimit -n 65535 || true
-          echo "fd limit after:  $(ulimit -n)"
-
-      - name: Run pipeline (all steps)
-        shell: bash
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          set -Eeuo pipefail
-          mkdir -p ALIVE logs
-          "$PYTHON_BIN" deepseek_python_simpled.py --steps '1+2+3'
-
-      - name: Upload ALIVE outputs
-        if: always() && hashFiles('ALIVE/**') != ''
-        uses: actions/upload-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          name: alive-${{ github.run_number }}
-          path: ALIVE/
-          if-no-files-found: warn
-          retention-days: 14
+          python-version: "3.12"
 
-      - name: Upload logs
-        if: always() && env.SAVE_ERROR_LOGS == 'true' && hashFiles('logs/**') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-${{ github.run_number }}
-          path: logs/
-          if-no-files-found: warn
-          retention-days: 14
+      - name: Install dependencies
+        run: python -m pip install "requests[socks]"
 
-      - name: Commit outputs
+      - name: Run pipeline
+        run: |
+          python proxy_pipeline.py \
+            --steps "${{ github.event.inputs.steps || '1+2+3' }}" \
+            --time-budget 75
+
+      - name: Upload diagnostics
         if: always()
-        shell: bash
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs
+          path: logs/
+          retention-days: 7
+
+      - name: Commit results
+        if: always()
         run: |
-          set -Eeuo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add -f ALIVE 2>/dev/null || true
-          if [[ "$SAVE_ERROR_LOGS" == "true" ]]; then
-            git add -f logs/failed.txt 2>/dev/null || true
-          fi
-
-          if git diff --cached --quiet; then
-            echo "No output changes."
-            exit 0
-          fi
-
-          git commit -m "chore: refresh proxy outputs [skip ci]"
+          git add ALIVE logs/summary.json
+          git diff --cached --quiet || git commit -m "chore: update proxy lists [skip ci]"
           git push
