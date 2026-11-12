@@ -7,35 +7,35 @@
   "source": {
     "urls": 38,
     "failed_urls": 0,
-    "raw": 81079,
-    "unique": 42237,
+    "raw": 80352,
+    "unique": 41953,
     "skipped": {
-      "vmess (parse failed)": 642,
-      "ss (parse failed)": 782,
-      "hysteria": 21,
-      "hysteria2": 929,
-      "ssr": 89,
+      "vmess (parse failed)": 665,
+      "ss (parse failed)": 849,
+      "hysteria": 19,
+      "hysteria2": 901,
+      "ssr": 74,
       "hy2": 320,
       "tuic": 14,
-      "vless (parse failed)": 23
+      "wireguard": 4
     }
   },
   "xray": "Xray 26.11.9 (Xray, Penetrates Everything.) 676eaf6 (go1.27.3 linux/amd64)",
   "endpoint": {
-    "pass": 3066,
-    "fail": 15427,
-    "unsupported": 392,
-    "skipped": 23352
+    "pass": 2937,
+    "fail": 14725,
+    "unsupported": 413,
+    "skipped": 23878
   },
   "enrich": {
     "gemini": {
-      "GEMINI": 2408,
+      "GEMINI": 2251,
       "NOGEMINI": 0,
-      "GEMERR": 658
+      "GEMERR": 686
     },
     "dead": 0,
-    "skipped": 23352
+    "skipped": 23878
   },
-  "duration_s": 4502.9,
-  "timestamp_utc": "2026-11-12T08:46:40+00:00"
+  "duration_s": 4503.0,
+  "timestamp_utc": "2026-11-12T14:13:21+00:00"
 }
