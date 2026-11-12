@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: proxy-pipeline
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -44,11 +44,27 @@ jobs:
           path: logs/
           retention-days: 7
 
-      - name: Commit results
-        if: always()
+      - name: Commit and push outputs
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ALIVE logs/summary.json
-          git diff --cached --quiet || git commit -m "chore: update proxy lists [skip ci]"
-          git push
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No output changes."
+            exit 0
+          fi
+          git commit -m "chore: refresh proxy outputs [skip ci]"
+      
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase -X theirs origin/main
+            if git push origin HEAD:main; then
+              echo "Pushed successfully."
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt), retrying..."
+            sleep $((attempt * 3))
+          done
+          echo "Failed to push after 5 attempts."
+          exit 1
