@@ -27,6 +27,7 @@ CI behavior:
   - Auto-installs xray into ./bin/ if missing (disable: --no-install-xray,
     pin with env XRAY_VERSION=v26.11.9, or point XRAY_BINARY at your own).
   - Writes logs/summary.json and appends a report to $GITHUB_STEP_SUMMARY.
+  - Samples of unparseable links are saved to logs/parse_failed.txt.
   - --time-budget MINUTES stops testing gracefully so results still get saved.
 
 Requires: Python 3.10+, requests[socks]  (pip install "requests[socks]")
@@ -246,16 +247,25 @@ def country_flag(code: str) -> str:
 
 def set_remark(uri: str, new_remark: str, protocol: str) -> str:
     if protocol == "vmess":
-        try:
-            raw = uri[len("vmess://"):].split("#", 1)[0]
-            data = json.loads(b64decode_lenient(raw).decode("utf-8", errors="replace"))
-            data["ps"] = new_remark
-            encoded = base64.b64encode(
-                json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            ).decode("ascii")
-            return f"vmess://{encoded}"
-        except Exception:
-            return uri
+        raw = uri[len("vmess://"):].split("#", 1)[0].split("?", 1)[0]
+        data = _vmess_json(raw)
+        if data is None:
+            # Shadowrocket-style vmess: normalize to standard JSON so the
+            # remark survives and every client understands the output.
+            p = parse_vmess(uri)
+            if not p:
+                return uri
+            data = {"v": "2", "add": p["address"], "port": p["port"], "id": p["uuid"],
+                    "aid": p.get("alterId", 0), "scy": p.get("security") or "auto",
+                    "net": p.get("network") or "tcp", "type": p.get("headerType") or "",
+                    "host": p.get("host") or "", "path": p.get("path") or "",
+                    "tls": p.get("tls") or "", "sni": p.get("sni") or "",
+                    "alpn": p.get("alpn") or "", "fp": p.get("fp") or ""}
+        data["ps"] = new_remark
+        encoded = base64.b64encode(
+            json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        return f"vmess://{encoded}"
     base, _, _ = uri.partition("#")
     return f"{base}#{quote(new_remark, safe='')}"
 
@@ -284,61 +294,118 @@ def _q(params: dict, key: str, default: str = "") -> str:
     return v[0] if v else default
 
 
-def parse_vmess(uri: str) -> dict | None:
+def _safe_int(value, default: int = 0) -> int:
     try:
-        raw = uri[len("vmess://"):].split("#", 1)[0]
-        data = json.loads(b64decode_lenient(raw).decode("utf-8", errors="replace"))
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        try:
+            return int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return default
+
+
+def _vmess_json(payload: str) -> dict | None:
+    """JSON payload hunt: std/urlsafe b64, percent-encoding, double-b64, BOM/NUL."""
+    seen: set[str] = set()
+    for cand in (payload, unquote(payload)):
+        text = cand
+        for _ in range(2):                      # some panels double-encode
+            if text in seen:
+                break
+            seen.add(text)
+            try:
+                decoded = b64decode_lenient(text).decode("utf-8", errors="replace")
+            except Exception:
+                break
+            cleaned = decoded.lstrip("\ufeff").strip().strip("\x00").strip()
+            try:
+                data = json.loads(cleaned)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+            text = cleaned
+    return None
+
+
+def parse_vmess(uri: str) -> dict | None:
+    payload = uri[len("vmess://"):].split("#", 1)[0]
+    payload, _, query = payload.partition("?")   # strip ?query BEFORE b64 decode
+    data = _vmess_json(payload)
+    if data is not None:
+        alpn = data.get("alpn", "")
+        if isinstance(alpn, list):              # some JSON variants use lists
+            alpn = ",".join(str(a) for a in alpn)
+        return {
+            "protocol": "vmess",
+            "address": data.get("add") or data.get("address") or "",
+            "port": _safe_int(data.get("port")), "uuid": data.get("id") or "",
+            "alterId": _safe_int(data.get("aid")),
+            "security": data.get("scy", "auto") or "auto",
+            "network": data.get("net", "tcp") or "tcp",
+            "headerType": data.get("type", ""), "host": data.get("host", ""),
+            "path": data.get("path", "") or "/", "tls": data.get("tls", ""),
+            "sni": data.get("sni", ""), "alpn": alpn or "",
+            "fp": data.get("fp", ""), "remark": data.get("ps", ""),
+        }
+    # Shadowrocket style: vmess://b64(cipher:uuid@host:port)?obfs=websocket&...
+    try:
+        decoded = b64decode_lenient(unquote(payload)).decode("utf-8", errors="replace").strip()
+        if "@" not in decoded or ":" not in decoded:
+            return None
+        method, rest = decoded.split(":", 1)
+        uuid, hostport = rest.rsplit("@", 1)
+        address, port = _split_host_port(hostport.split("/", 1)[0])
     except Exception:
         return None
-    try:
-        port = int(data.get("port", 0) or 0)
-    except (TypeError, ValueError):
-        port = 0
-    try:
-        aid = int(data.get("aid", 0) or 0)
-    except (TypeError, ValueError):
-        aid = 0
-    alpn = data.get("alpn", "")
-    if isinstance(alpn, list):                      # some JSON variants use lists
-        alpn = ",".join(str(a) for a in alpn)
+    if not address or not uuid or not (0 < port < 65536):
+        return None
+    params = parse_qs(query)
+    obfs = _q(params, "obfs", "none").lower()
+    network = {"websocket": "ws", "ws": "ws", "http": "h2", "h2": "h2",
+               "grpc": "grpc"}.get(obfs, "tcp")
+    tls = "tls" if _q(params, "tls", "0").lower() in ("1", "true") else ""
     return {
-        "protocol": "vmess", "address": data.get("add", ""), "port": port,
-        "uuid": data.get("id", ""), "alterId": aid,
-        "security": data.get("scy", "auto") or "auto",
-        "network": data.get("net", "tcp") or "tcp",
-        "headerType": data.get("type", ""), "host": data.get("host", ""),
-        "path": data.get("path", "") or "/", "tls": data.get("tls", ""),
-        "sni": data.get("sni", ""), "alpn": alpn or "",
-        "fp": data.get("fp", ""), "remark": data.get("ps", ""),
+        "protocol": "vmess", "address": address, "port": port, "uuid": uuid,
+        "alterId": _safe_int(_q(params, "alterId", "0")),
+        "security": method or "auto", "network": network,
+        "headerType": "", "host": _q(params, "obfsParam", ""),
+        "path": _q(params, "path", "") or "/", "tls": tls,
+        "sni": _q(params, "sni", "") or _q(params, "peer", ""),
+        "alpn": "", "fp": "", "remark": _q(params, "remarks", ""),
     }
 
 
 def parse_url_style(uri: str, protocol: str) -> dict | None:
     try:
         p = urlparse(uri)
-        params = parse_qs(p.query)
-        # TLS is IMPLICIT for trojan; links often omit security=tls.
-        default_tls = "tls" if protocol == "trojan" else ""
-        insecure = _q(params, "allowInsecure", _q(params, "insecure", "")).lower() in ("1", "true")
-        return {
-            "protocol": protocol, "uuid": unquote(p.username or ""),
-            "address": p.hostname or "", "port": p.port or 0,
-            "remark": unquote(p.fragment or ""),
-            "network": _q(params, "type", "tcp") or "tcp",
-            "tls": _q(params, "security", default_tls),
-            "sni": _q(params, "sni", ""), "host": _q(params, "host", ""),
-            "path": _q(params, "path", "") or "/",
-            "fp": _q(params, "fp", ""), "alpn": _q(params, "alpn", ""),
-            "flow": _q(params, "flow", ""),
-            "serviceName": _q(params, "serviceName", ""),
-            "pbk": _q(params, "pbk", ""), "sid": _q(params, "sid", ""),
-            "spx": _q(params, "spx", ""),
-            "headerType": _q(params, "headerType", ""),
-            "mode": _q(params, "mode", ""),
-            "allowInsecure": insecure,
-        }
-    except Exception:
-        return None
+    except ValueError:
+        return None                              # truly malformed authority
+    try:
+        port = p.port or 0                       # .port RAISES on garbage ports
+    except ValueError:
+        port = 0                                 # -> "unsupported" later, not parse-failed
+    params = parse_qs(p.query)
+    # TLS is IMPLICIT for trojan; links often omit security=tls.
+    default_tls = "tls" if protocol == "trojan" else ""
+    insecure = _q(params, "allowInsecure", _q(params, "insecure", "")).lower() in ("1", "true")
+    return {
+        "protocol": protocol, "uuid": unquote(p.username or ""),
+        "address": p.hostname or "", "port": port,
+        "remark": unquote(p.fragment or ""),
+        "network": _q(params, "type", "tcp") or "tcp",
+        "tls": _q(params, "security", default_tls),
+        "sni": _q(params, "sni", ""), "host": _q(params, "host", ""),
+        "path": _q(params, "path", "") or "/",
+        "fp": _q(params, "fp", ""), "alpn": _q(params, "alpn", ""),
+        "flow": _q(params, "flow", ""),
+        "serviceName": _q(params, "serviceName", ""),
+        "pbk": _q(params, "pbk", ""), "sid": _q(params, "sid", ""),
+        "spx": _q(params, "spx", ""),
+        "headerType": _q(params, "headerType", ""),
+        "mode": _q(params, "mode", ""),
+        "allowInsecure": insecure,
+    }
 
 
 def _split_host_port(s: str) -> tuple[str, int]:
@@ -371,6 +438,7 @@ def parse_ss(uri: str) -> dict | None:
         }
         if "@" in body:                             # SIP002
             userinfo, hostport = body.rsplit("@", 1)
+            hostport = hostport.split("/", 1)[0]    # strip trailing /path
             userinfo = unquote(userinfo)
             if ":" in userinfo:                     # plaintext method:password
                 method, password = userinfo.split(":", 1)
@@ -379,12 +447,12 @@ def parse_ss(uri: str) -> dict | None:
                 if ":" not in decoded:
                     return None
                 method, password = decoded.split(":", 1)
-            address, port = _split_host_port(hostport)
         else:                                       # legacy full-base64
             decoded = b64decode_lenient(body).decode("utf-8", errors="replace")
             method_pass, hostport = decoded.rsplit("@", 1)
+            hostport = hostport.split("/", 1)[0]    # same, inside the b64 body
             method, password = method_pass.split(":", 1)
-            address, port = _split_host_port(hostport)
+        address, port = _split_host_port(hostport)
         if not address or not method or not (0 < port < 65536):
             return None
         return {**base, "address": address, "port": port,
@@ -424,6 +492,7 @@ def parse_and_dedupe(raw_uris: list[str]) -> tuple[list[tuple[str, dict]], Count
     unique: list[tuple[str, dict]] = []
     seen: set[tuple] = set()
     skipped: Counter = Counter()
+    failures: list[str] = []
     for uri in raw_uris:
         scheme = uri.split("://", 1)[0].lower()
         if scheme not in SUPPORTED_SCHEMES:
@@ -432,12 +501,21 @@ def parse_and_dedupe(raw_uris: list[str]) -> tuple[list[tuple[str, dict]], Count
         p = parse_config(uri)
         if not p:
             skipped[f"{scheme} (parse failed)"] += 1
+            if len(failures) < 100:                 # keep samples for auditing
+                failures.append(uri)
             continue
         fp = fingerprint(p)
         if fp in seen:
             continue
         seen.add(fp)
         unique.append((uri, p))
+    if failures:
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            (LOG_DIR / "parse_failed.txt").write_text(
+                "\n".join(failures) + "\n", encoding="utf-8")
+        except OSError:
+            pass
     return unique, skipped
 
 
@@ -1117,6 +1195,8 @@ def run_source_fetch() -> list[tuple[str, dict]] | None:
     log(f"[Step 1] Total: {len(raw_uris)}  Unique: {len(unique)}")
     if skipped:
         log("[Step 1]   Skipped: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
+    if any("(parse failed)" in k for k in skipped):
+        log(f"[Step 1]   Parse-failure samples: {LOG_DIR / 'parse_failed.txt'}")
     _write(ALIVE_DIR / "all.txt", [u for u, _ in unique])
     log(f"[Step 1] Saved: {ALIVE_DIR / 'all.txt'}")
 
@@ -1139,6 +1219,8 @@ def run_source_custom(path: Path) -> list[tuple[str, dict]] | None:
     log(f"[Step 1] Loaded {len(configs)} unique configs")
     if skipped:
         log("[Step 1]   Skipped: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
+    if any("(parse failed)" in k for k in skipped):
+        log(f"[Step 1]   Parse-failure samples: {LOG_DIR / 'parse_failed.txt'}")
     _write(ALIVE_DIR / "all.txt", [u for u, _ in configs])
     log(f"[Step 1] Saved: {ALIVE_DIR / 'all.txt'}")
     SUMMARY["source"] = {"custom_file": str(path), "raw": len(configs),
