@@ -4,7 +4,8 @@ Proxy config pipeline — GitHub Actions friendly edition.
 
 Steps:
   1 = Fetch subscriptions / custom file (source)
-  2 = Endpoint test (xray + real HTTPS probes)
+  2 = Endpoint test (xray + real HTTPS probes, then a 100 KB / 3 s speed
+      download on the SAME session and worker pool — not a separate step)
   3 = Enrich (Gemini + Geo, no filtering)
 When 2 and 3 are both selected, they share ONE xray session per config.
 
@@ -12,7 +13,9 @@ Outputs (./ALIVE/):
   all.txt      deduplicated source configs
   working.txt  configs that passed the endpoint test
   enriched.txt annotated configs:
-               {flag}-{CC}-{GEMINI|NOGEMINI|GEMERR}-{idx}
+               {flag}-{CC}-{GEMINI|NOGEMINI|GEMERR}-{idx}-{speed}KB
+               e.g. 🇩🇪-DE-GEMINI-007-850KB  (speed suffix = KB/s from the
+               100 KB probe; present only when step 2 ran)
                dead proxies (enrich-only mode) get {flag}-{CC}-DEAD-{idx}
 
 Label semantics:
@@ -27,6 +30,7 @@ CI behavior:
   - Auto-installs xray into ./bin/ if missing (disable: --no-install-xray,
     pin with env XRAY_VERSION=v26.11.9, or point XRAY_BINARY at your own).
   - Writes logs/summary.json and appends a report to $GITHUB_STEP_SUMMARY.
+  - Speed results: logs/speed_test.txt (fastest first) + avg/median/max stats.
   - Samples of unparseable links are saved to logs/parse_failed.txt.
   - --time-budget MINUTES stops testing gracefully so results still get saved.
 
@@ -45,6 +49,7 @@ import random
 import re
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -96,6 +101,14 @@ TEST_ENDPOINTS = [
 TEST_TIMEOUT = (3, 5)            # connect, read — through a proxy chain
 ENDPOINT_ROUNDS = 2              # one full retry round
 TEST_WORKERS = 40                # concurrent test workers (steps 2 and 3)
+
+# ---- Download speed probe (part of step 2, NOT a separate step) ----
+# Runs on the SAME xray session and SAME worker pool as the endpoint test,
+# immediately after a config passes its endpoint probe.
+SPEED_TEST_BYTES = 100_000        # 100 KB payload
+SPEED_TEST_URL = f"https://speed.cloudflare.com/__down?bytes={SPEED_TEST_BYTES}"
+SPEED_TIMEOUT = 3.0               # seconds: connect/read timeout + total transfer cap
+SPEED_CHUNK = 4096                # small chunks so the 3 s wall-clock cap stays tight
 
 # ---- Gemini check ----
 GEMINI_TEST_URL = "https://gemini.google.com/?hl=en"
@@ -276,7 +289,8 @@ def gemini_tag(res: SiteResult) -> str:
     return "NOGEMINI" if res.category == "blocked" else "GEMERR"
 
 
-def build_enriched_remark(res: EnrichResult, idx: int) -> str:
+def build_enriched_remark(res: EnrichResult, idx: int,
+                          speed: SpeedResult | None = None) -> str:
     parts: list[str] = []
     if res.country:
         parts.append(f"{country_flag(res.country)}-{res.country}")
@@ -285,6 +299,8 @@ def build_enriched_remark(res: EnrichResult, idx: int) -> str:
     else:
         parts.append(gemini_tag(res.gemini))
     parts.append(f"{idx:03d}")   # unique per run -> no identical remarks
+    if speed is not None:
+        parts.append(f"{speed.kbps:.0f}KB")   # measured KB/s, e.g. 850KB
     return "-".join(parts)
 
 
@@ -842,9 +858,18 @@ class EnrichResult:
 
 
 @dataclass
+class SpeedResult:
+    kbps: float              # KB/s (bytes/1000 per second); 0.0 if nothing arrived
+    received: int            # bytes actually downloaded (<= SPEED_TEST_BYTES)
+    seconds: float           # wall-clock seconds (incl. connect/TLS setup)
+    complete: bool           # full 100 KB arrived within the 3 s cap
+
+
+@dataclass
 class Outcome:
     alive: bool
     enrich: EnrichResult | None = None
+    speed: SpeedResult | None = None
 
 
 # ---------------------------------------------------------------- tests
@@ -865,6 +890,37 @@ def endpoint_check(proxies: dict) -> bool:
                 continue
             return True
     return False
+
+
+def speed_check(proxies: dict) -> SpeedResult:
+    """Download 100 KB through the SAME xray session, capped at 3 seconds.
+
+    Called right after the endpoint probe passes (same worker, same session —
+    no extra step, no extra concurrency). Partial downloads still count:
+    speed = bytes received / elapsed wall-clock time.
+    """
+    start = time.monotonic()
+    received = 0
+    try:
+        with requests.get(SPEED_TEST_URL, headers=HEADERS, proxies=proxies,
+                          timeout=(SPEED_TIMEOUT, SPEED_TIMEOUT), stream=True) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(SPEED_CHUNK):
+                received += len(chunk)
+                if (received >= SPEED_TEST_BYTES
+                        or time.monotonic() - start >= SPEED_TIMEOUT
+                        or STOP.is_set() or deadline_exceeded()):
+                    break
+    except requests.RequestException:
+        pass                                  # keep whatever bytes arrived
+    elapsed = max(time.monotonic() - start, 1e-6)
+    received = min(received, SPEED_TEST_BYTES)
+    return SpeedResult(
+        kbps=(received / 1000.0) / elapsed,
+        received=received,
+        seconds=elapsed,
+        complete=received >= SPEED_TEST_BYTES,
+    )
 
 
 def _normalize_for_match(s: str) -> str:
@@ -965,22 +1021,26 @@ def test_worker(p: dict, do_endpoint: bool, do_enrich: bool) -> Outcome:
             _check_stop()
             return Outcome(False, EnrichResult.make_dead("Proxy startup failed")
                            if do_enrich else None)
+        speed: SpeedResult | None = None
         if do_endpoint:
             if not endpoint_check(proxies):
                 return Outcome(False)
+            # 100 KB / 3 s speed probe: SAME xray session, SAME worker.
+            # Part of step 2 — not an extra step, no extra concurrency.
+            speed = speed_check(proxies)
         elif do_enrich:
             # Enrich-only mode: cheap liveness probe so dead nodes get DEAD,
             # not a misleading NOGEMINI.
             if not endpoint_check(proxies):
                 return Outcome(False, EnrichResult.make_dead("Endpoint probe failed"))
         if not do_enrich:
-            return Outcome(True)
+            return Outcome(True, speed=speed)
         try:
             res = enrich_with_proxies(proxies)      # same session as step 2
         except Exception as e:
             res = EnrichResult(SiteResult(False, f"Test exception: {type(e).__name__}: {e}",
                                           "other"))
-        return Outcome(True, res)
+        return Outcome(True, res, speed)
 
 
 # ---------------------------------------------------------------- progress / io
@@ -1032,11 +1092,27 @@ class LineWriter:
         return False
 
 
-def _write_enrich_diagnostics(path: Path, entries: list[tuple[str, EnrichResult]]) -> None:
+def _write_speed_log(path: Path, entries: list[tuple[str, SpeedResult]]) -> None:
+    ordered = sorted(entries, key=lambda t: t[1].kbps, reverse=True)   # fastest first
     with path.open("w", encoding="utf-8", newline="\n") as f:
-        for i, (uri, res) in enumerate(entries, 1):
+        for i, (uri, s) in enumerate(ordered, 1):
+            state = "full" if s.complete else ("partial, 3s cap" if s.received else "no data")
+            f.write(f"[{i}] {s.kbps:9.1f} KB/s  {s.received:6d}/{SPEED_TEST_BYTES} B  "
+                    f"{s.seconds:4.2f}s  {state}\n")
+            f.write(f"URI: {uri}\n")
+            f.write("-" * 80 + "\n")
+
+
+def _write_enrich_diagnostics(path: Path,
+                              entries: list[tuple[str, EnrichResult, SpeedResult | None]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        for i, (uri, res, speed) in enumerate(entries, 1):
             f.write(f"[{i}] URI: {uri}\n")
             f.write(f"Country: {res.country or 'unknown'}\n")
+            if speed is not None:
+                state = "full" if speed.complete else ("partial, 3s cap" if speed.received else "no data")
+                f.write(f"Speed: {speed.kbps:.1f} KB/s "
+                        f"({speed.received}/{SPEED_TEST_BYTES} B in {speed.seconds:.2f}s, {state})\n")
             if res.dead:
                 f.write(f"DEAD: {res.gemini.status}\n")
             else:
@@ -1069,6 +1145,12 @@ def write_summary_files(duration_s: float) -> None:
         lines += ["### Endpoint test", "",
                   "| PASS | FAIL | Unsupported | Skipped |", "|---|---|---|---|",
                   f"| {ep['pass']} | {ep['fail']} | {ep['unsupported']} | {ep['skipped']} |", ""]
+    sp = SUMMARY.get("speed")
+    if sp:
+        lines += ["### Download speed (100 KB, 3 s cap)", "",
+                  f"- Tested: {sp['tested']} | Full: {sp['complete']} | No data: {sp['no_data']}",
+                  f"- Avg: {sp['avg_kbps']} KB/s | Median: {sp['median_kbps']} KB/s "
+                  f"| Max: {sp['max_kbps']} KB/s", ""]
     en = SUMMARY.get("enrich")
     if en:
         g = en["gemini"]
@@ -1218,7 +1300,7 @@ def run_source_custom(path: Path) -> list[tuple[str, dict]] | None:
     configs, skipped = load_configs_from_file(path)
     log(f"[Step 1] Loaded {len(configs)} unique configs")
     if skipped:
-        log("[Step 1]   Skipped: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
+        log(f"[Step 1]   Skipped: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
     if any("(parse failed)" in k for k in skipped):
         log(f"[Step 1]   Parse-failure samples: {LOG_DIR / 'parse_failed.txt'}")
     _write(ALIVE_DIR / "all.txt", [u for u, _ in configs])
@@ -1233,9 +1315,9 @@ def run_tests(configs: list[tuple[str, dict]], do_endpoint: bool, do_enrich: boo
               args: argparse.Namespace) -> list[tuple[str, dict]] | None:
     label = ("Step 2+3" if do_endpoint and do_enrich
              else "Step 2" if do_endpoint else "Step 3")
-    log(f"[{label}] " + ("Endpoint test + Enrich (shared xray sessions)"
+    log(f"[{label}] " + ("Endpoint test + speed probe + Enrich (shared xray sessions)"
                          if do_endpoint and do_enrich
-                         else "Endpoint Test" if do_endpoint
+                         else "Endpoint Test + speed probe" if do_endpoint
                          else "Enrich (Gemini + Geo)"))
     testable = [(u, p) for u, p in configs if build_outbound(p) is not None]
     unsupported = len(configs) - len(testable)
@@ -1249,8 +1331,11 @@ def run_tests(configs: list[tuple[str, dict]], do_endpoint: bool, do_enrich: boo
 
     passed_pairs: list[tuple[str, dict]] = []
     enriched_pairs: list[tuple[str, dict]] = []
-    diag_entries: list[tuple[str, EnrichResult]] = []
+    diag_entries: list[tuple[str, EnrichResult, SpeedResult | None]] = []
+    speed_entries: list[tuple[str, SpeedResult]] = []
     passed = failed = skipped_budget = dead = idx = 0
+    speed_sum = 0.0
+    speed_n = 0
     gtags: Counter = Counter()
     start = time.time()
 
@@ -1277,6 +1362,11 @@ def run_tests(configs: list[tuple[str, dict]], do_endpoint: bool, do_enrich: boo
                     _endline()
                     log(f"[{label}]   ERR {uri[:70]}: {e}")
                 else:
+                    if outcome.speed is not None:
+                        speed_entries.append((uri, outcome.speed))
+                        if outcome.speed.received > 0:
+                            speed_sum += outcome.speed.kbps
+                            speed_n += 1
                     if do_endpoint:
                         if outcome.alive:
                             passed += 1
@@ -1288,13 +1378,13 @@ def run_tests(configs: list[tuple[str, dict]], do_endpoint: bool, do_enrich: boo
                             and (outcome.alive or not do_endpoint)):
                         res = outcome.enrich
                         idx += 1
-                        remark = build_enriched_remark(res, idx)
+                        remark = build_enriched_remark(res, idx, outcome.speed)
                         new_uri = set_remark(uri, remark, p["protocol"])
                         new_p = dict(p)
                         new_p["remark"] = remark
                         enriched_pairs.append((new_uri, new_p))
                         ew.write(new_uri)
-                        diag_entries.append((uri, res))
+                        diag_entries.append((uri, res, outcome.speed))
                         if res.dead:
                             dead += 1
                         else:
@@ -1304,6 +1394,8 @@ def run_tests(configs: list[tuple[str, dict]], do_endpoint: bool, do_enrich: boo
                     extra_parts.append(f"PASS {passed} FAIL {failed}")
                 if do_enrich:
                     extra_parts.append(f"Gem:{gtags['GEMINI']} Dead:{dead}")
+                if speed_n:
+                    extra_parts.append(f"Avg {speed_sum / speed_n:.0f}KB/s")
                 if skipped_budget:
                     extra_parts.append(f"SKIP {skipped_budget}")
                 _render_bar(label, done, len(testable), start, "  ".join(extra_parts))
@@ -1322,6 +1414,22 @@ def run_tests(configs: list[tuple[str, dict]], do_endpoint: bool, do_enrich: boo
         log(f"[{label}] Saved: {ALIVE_DIR / 'working.txt'}")
         SUMMARY["endpoint"] = {"pass": passed, "fail": failed,
                                "unsupported": unsupported, "skipped": skipped_budget}
+    if speed_entries:
+        speed_path = LOG_DIR / "speed_test.txt"
+        _write_speed_log(speed_path, speed_entries)
+        oks = [s.kbps for _, s in speed_entries if s.received > 0]
+        full = sum(1 for _, s in speed_entries if s.complete)
+        no_data = sum(1 for _, s in speed_entries if s.received == 0)
+        SUMMARY["speed"] = {
+            "tested": len(speed_entries), "complete": full, "no_data": no_data,
+            "avg_kbps": round(statistics.mean(oks), 1) if oks else 0.0,
+            "median_kbps": round(statistics.median(oks), 1) if oks else 0.0,
+            "max_kbps": round(max(oks), 1) if oks else 0.0,
+        }
+        sp = SUMMARY["speed"]
+        log(f"[{label}] Speed (100KB/3s): avg {sp['avg_kbps']}  median {sp['median_kbps']}  "
+            f"max {sp['max_kbps']} KB/s  |  full {full}/{len(speed_entries)}  no-data {no_data}")
+        log(f"[{label}] Speed log: {speed_path}")
     if do_enrich:
         diag_path = LOG_DIR / "enrich_checks.txt"
         _write_enrich_diagnostics(diag_path, diag_entries)
