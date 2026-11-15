@@ -2,7 +2,8 @@
 # Lines starting with # are ignored. Blank lines are ignored. Duplicates collapsed.
 
 https://raw.githubusercontent.com/Surfboardv2ray/Proxy-sorter/refs/heads/main/input/proxies.txt
-https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/all_configs.txt
+https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/all_configs
+https://raw.githubusercontent.com/mhcfpTopic/config/main/xray_final.txt
 https://www.ermao.net/sub/v2ray/ermao.net
 https://sub.darkpx.workers.dev/all
 https://raw.githubusercontent.com/mohamadfg-dev/telegram-v2ray-configs-collector/refs/heads/main/category/Iran.txt
