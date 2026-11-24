@@ -6,43 +6,43 @@
   ],
   "source": {
     "urls": 39,
-    "failed_urls": 0,
-    "raw": 85384,
-    "unique": 44263,
+    "failed_urls": 1,
+    "raw": 75434,
+    "unique": 42872,
     "skipped": {
-      "vmess (parse failed)": 1121,
-      "ss (parse failed)": 644,
-      "hysteria2": 933,
-      "hy2": 460,
-      "hysteria": 22,
-      "tuic": 10,
-      "ssr": 71
+      "vmess (parse failed)": 21,
+      "ss (parse failed)": 499,
+      "hysteria2": 1238,
+      "hy2": 446,
+      "ssr": 77,
+      "hysteria": 13,
+      "tuic": 9
     }
   },
   "xray": "Xray 26.11.9 (Xray, Penetrates Everything.) 676eaf6 (go1.27.3 linux/amd64)",
   "endpoint": {
-    "pass": 3050,
-    "fail": 14249,
-    "unsupported": 444,
-    "skipped": 26520
+    "pass": 2970,
+    "fail": 13699,
+    "unsupported": 240,
+    "skipped": 25963
   },
   "speed": {
-    "tested": 3050,
-    "complete": 2134,
-    "no_data": 515,
-    "avg_kbps": 119.1,
-    "median_kbps": 97.2,
-    "max_kbps": 1044.8
+    "tested": 2970,
+    "complete": 2108,
+    "no_data": 566,
+    "avg_kbps": 136.4,
+    "median_kbps": 92.3,
+    "max_kbps": 1263.0
   },
   "enrich": {
     "gemini": {
-      "GEMINI": 2404,
+      "GEMINI": 2282,
       "NOGEMINI": 0,
-      "GEMERR": 646
+      "GEMERR": 688
     },
     "dead": 0,
-    "skipped": 26520
+    "skipped": 25963
   },
-  "duration_s": 4513.1,
-  "timestamp_utc": "2026-11-23T16:14:33+00:00"
+  "duration_s": 4507.9,
+  "timestamp_utc": "2026-11-24T16:15:41+00:00"
 }
